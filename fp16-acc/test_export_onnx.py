@@ -6,6 +6,18 @@ from onnxruntime import OrtValue
 import psutil
 import numpy as np
 import math
+from transformers import BloomConfig, BloomModel, AutoTokenizer
+from models.modeling_bloom import BloomModel as BloomModelLocal
+
+def get_bloom_model(name):
+    config = BloomConfig.from_pretrained(name)
+    config.n_layer = 1
+    model = BloomModel.from_pretrained(name, torch_dtype=torch.float32, config=config)
+    #model = BloomModelLocal.from_pretrained(name, process_group=None, config=config)
+    #model = BloomModelLocal(process_group=None, config=config)
+    tokenizer = AutoTokenizer.from_pretrained(name)
+    return config, model, tokenizer
+
 
 def setup_session_option(args, local_rank):
     so = ort.SessionOptions()
@@ -144,18 +156,30 @@ def main():
     torch.cuda.manual_seed(42)
     device = torch.device('cuda:0')
 
-    model = TestModule(num_layers, features, num_heads, use_residual, use_layernorm)
-    model.requires_grad_(False)
-    model.half()
+    #model = TestModule(num_layers, features, num_heads, use_residual, use_layernorm)
+    #model.requires_grad_(False)
+    #model.half()
+    #model.to(device)
+
+    #x = torch.randn(1, seqlen, features, device=device, dtype=torch.float16)
+    #inputs = (x,)
+    #input_names = ['input']
+    #output_names = ['out']
+
+    config, model, tokenizer = get_bloom_model('bigscience/bloom-560m')
     model.to(device)
+    model.requires_grad_(False)
 
-    x = torch.randn(1, seqlen, features, device=device, dtype=torch.float16)
+    dummy_inputs = tokenizer('hello world' * (seqlen // 2), return_tensors='pt')
+    input_ids = dummy_inputs['input_ids'].to(device)
+    atten_mask = dummy_inputs['attention_mask'].to(device)
+    input_names = ['input_ids', 'attention_mask']
+    inputs = (input_ids, atten_mask)
+    inputs = {k:v for k,v in zip(input_names, inputs)}
+    output_names = ['output']
 
-    inputs = (x,)
-    input_names = ['input']
-    output_names = ['out']
-
-    out1 = model(*inputs)
+    out1 = model(**inputs)
+    out1 = out1[0]
 
     tmp_file = 'test.onnx'
 
@@ -174,7 +198,7 @@ def main():
             do_constant_folding=True,
         )
 
-    out2 = run_onnxruntime(None, tmp_file, {k: v for k, v in zip(input_names, inputs)}, 0)
+    out2 = run_onnxruntime(None, tmp_file, inputs, 0)
 
     print(f'out shape: {out1.shape}, out type: {out1.dtype}')
 
