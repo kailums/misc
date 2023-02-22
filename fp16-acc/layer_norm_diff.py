@@ -52,11 +52,14 @@ class TestModule(torch.nn.Module):
 
 
 def main():
-    batch = 1
+    batch = 8
     seqlen = 128
     features = 1024
     torch.cuda.manual_seed(42)
     device = torch.device('cuda:0')
+    r = torch.rand((1,))
+    r = r * 256
+    print('r is: ', r)
 
     state_dict = torch.load('last_ln.pt')
 
@@ -64,9 +67,17 @@ def main():
     model.requires_grad_(False)
 
     model.to(device)
-    model.ln_f.load_state_dict(state_dict['ln_state_dict'])
 
-    data = state_dict['hidden_states']
+    #model.ln_f.load_state_dict(state_dict['ln_state_dict'])
+    for p in model.parameters():
+        p[:] = r[0]
+
+    #data = state_dict['hidden_states']
+    data = torch.rand((batch, seqlen, features)).to(device)
+    data[:] = r[0]
+
+    model.half()
+    data = data.to(torch.float16)
 
     inputs = (data,)
     input_names = ['x']
