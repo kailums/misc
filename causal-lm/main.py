@@ -84,12 +84,11 @@ class GenerateWrapper(PreTrainedModel):
 
     def prepare_inputs_for_generation(self, input_ids, attention_mask, **kwargs):
         ret = {'input_ids': input_ids, 'attention_mask': attention_mask}
-        ret = {k: v.cpu().numpy() for k, v in ret.items()}
         return ret
 
     def forward(self, input_ids, attention_mask, **kwargs):
-        out = self.infer_func(input_ids, attention_mask)
-        return CausalLMOutputWithCrossAttentions(logits=torch.from_numpy(out[0]))
+        out = self.infer_func(input_ids, attention_mask, **kwargs)
+        return CausalLMOutputWithCrossAttentions(logits=out)
 
 
 def run_onnxruntime(args, model_file, inputs, model_name, config, device):
@@ -111,12 +110,14 @@ def run_onnxruntime(args, model_file, inputs, model_name, config, device):
     #for out in outputs:
     #    io_binding.bind_output(out.name, 'cuda', local_rank)
 
-    def infer_func(input_ids, attention_mask):
+    def infer_func(input_ids, attention_mask, **kwargs):
         #sess.run_with_iobinding(io_binding)
         #output = io_binding.copy_outputs_to_cpu()
         #print('input ids: ', input_ids.shape, ' atten shape: ', attention_mask.shape)
-        out = sess.run(None, {'input_ids': input_ids, 'attention_mask':attention_mask})
-        return out
+        inputs = {'input_ids': input_ids, 'attention_mask':attention_mask}
+        inputs = {k: v.cpu().numpy() for k, v in inputs.items()}
+        out = sess.run(None, inputs)
+        return torch.from_numpy(out[0])
 
     model = GenerateWrapper(infer_func, config=config)
 
@@ -157,15 +158,25 @@ def get_bloom_model(args, name):
     tokenizer = AutoTokenizer.from_pretrained(name)
     return config, model, tokenizer
 
-def run_torch_model(args, model, inputs, device):
+def run_torch_model(args, model, config, inputs, device):
     if args.fp16:
         model.half()
 
     model.to(device)
     inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    def infer_torch(input_ids, attention_mask, **kwargs):
+        inputs = {'input_ids': input_ids, 'attention_mask': attention_mask}
+        #inputs.update(kwargs)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        out = model(**inputs)
+        return out.logits
+
+    gen_model = GenerateWrapper(infer_torch, config=config)
+
     # try warmup
     with torch.no_grad():
-        output = model.generate(**inputs, max_length=args.gen_len)
+        output = gen_model.generate(**inputs, max_length=args.gen_len)
 
     print('output: ', output.shape, ' dtype:', output.dtype, ' dev:', output.device)
 
@@ -176,7 +187,7 @@ def run_torch_model(args, model, inputs, device):
     for i in range(args.loop_cnt):
         with torch.autograd.profiler.emit_nvtx(args.profile):
             with torch.no_grad():
-                output = model.generate(**inputs, max_length=args.gen_len)
+                output = gen_model.generate(**inputs, max_length=args.gen_len)
 
         if local_rank == 0 and i % interval == 0:
             cost_time = time.time() - end
@@ -271,8 +282,8 @@ def main(args):
         model.requires_grad_(False)
 
     #prompt = ['Morning, I want to', 'My dog is', 'If you want to, I']
-    #prompt = ['My dog is']
-    prompt = ['Morning, I want to']
+    prompt = ['My dog is']
+    #prompt = ['Morning, I want to']
     inputs = tokenizer(prompt, return_tensors='pt', padding=True)
     inputs = {k : v for k,v in inputs.items()}
     input_names = list(inputs.keys())
@@ -287,7 +298,7 @@ def main(args):
         export_model(args, model, config, world_size, local_rank, inputs, input_names, output_names, model_out_file, tmp_file, opt_out_file)
 
     if not args.no_torch_infer:
-        torch_out = run_torch_model(args, model, inputs, device)
+        torch_out = run_torch_model(args, model, config, inputs, device)
         gen_torch_out = tokenizer.batch_decode(torch_out, skip_special_token=True)
         print('torch res: ', gen_torch_out)
 
