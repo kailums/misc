@@ -161,19 +161,19 @@ def matmul(a, b):
 def main(args=None):
     device = torch.device(0)
     torch.manual_seed(0)
-    a_shape = (1024, 2048)
-    b_shape = (2048, 512)
+    a_shape = (2048,)
+    b_shape = (2048,)
     a = torch.randn(a_shape).to(device).half()
     b = torch.randn(b_shape).to(device).half()
 
-    #triton_out = add(a, b)
-    #torch_out = a + b
+    triton_out = add(a, b)
+    torch_out = a + b
 
     #triton_out = softmax(a)
     #torch_out = torch.softmax(a, axis=1)
 
-    triton_out = matmul(a, b)
-    torch_out = torch.matmul(a,b)
+    #triton_out = matmul(a, b)
+    #torch_out = torch.matmul(a,b)
 
     if torch.allclose(triton_out, torch_out):
         print('result is SAME')

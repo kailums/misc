@@ -21,7 +21,7 @@ def setup_session_option(args, local_rank):
 def run_onnxruntime(args, model_file, inputs, local_rank):
     print('infer ort in rank: ', local_rank, ' m: ', model_file)
     so = setup_session_option(args, local_rank) 
-    sess = ort.InferenceSession(model_file, sess_options=so, providers=[('CUDAExecutionProvider',{'device_id':local_rank})])
+    sess = ort.InferenceSession(model_file, sess_options=so, providers=[('ROCMExecutionProvider',{'device_id':local_rank})])
     io_binding = sess.io_binding()
 
     # bind inputs by using OrtValue
@@ -76,8 +76,8 @@ def main():
     data = torch.rand((batch, seqlen, features)).to(device)
     data[:] = r[0]
 
-    model.half()
-    data = data.to(torch.float16)
+    #model.half()
+    #data = data.to(torch.float16)
 
     inputs = (data,)
     input_names = ['x']
