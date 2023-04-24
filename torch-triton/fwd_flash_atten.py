@@ -5,14 +5,13 @@ import triton
 import triton.language as tl
 import math
 
-
 @triton.jit
 def _fwd_kernel(
     Q, K, V, sm_scale,
-    L, M,TMP,
+    L, M,
     Out,
     stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kk, stride_kn,
+    stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
     stride_oz, stride_oh, stride_om, stride_on,
     Z, H, N_CTX,
@@ -26,9 +25,8 @@ def _fwd_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
     off_q = off_hz * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
-    #off_k = off_hz * stride_qh + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kk
-    off_k = off_hz * stride_kh + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kk
-    off_v = off_hz * stride_vh + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+    off_k = off_hz * stride_qh + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kk
+    off_v = off_hz * stride_qh + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qk
     # Initialize pointers to Q, K, V
     q_ptrs = Q + off_q
     k_ptrs = K + off_k
@@ -37,7 +35,6 @@ def _fwd_kernel(
     m_prev = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_prev = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-    t_ptrs = TMP + off_hz * stride_qh + offs_m
     # load q: it will stay in SRAM throughout
     q = tl.load(q_ptrs)
     # loop over k, v and update accumulator
@@ -47,7 +44,7 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         qk *= sm_scale
-        qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
+        #qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         # compute new m
         m_curr = tl.maximum(tl.max(qk, 1), m_prev)  # (m,)
         # correct old l
@@ -58,13 +55,7 @@ def _fwd_kernel(
         # rescale operands of matmuls
         l_rcp = 1. / l_curr    # (m,)
         p *= l_rcp[:, None]
-
-        # workaround BUG of trtion
-        l = l_prev * l_rcp   # (m,)
-        tl.store(t_ptrs, l)
-        l = tl.load(t_ptrs)
-        acc = acc * l[:, None]
-        #acc *= (l_prev * l_rcp)[:, None]
+        acc *= (l_prev * l_rcp)[:, None]
 
         # update acc
         p = p.to(Q.dtype.element_ty)
@@ -93,20 +84,19 @@ def _fwd_kernel(
 def flash_att_fwd(q, k, v):
     BLOCK = 64
     # shape constraints
-    Lq, Lk, Lv = q.shape[-1], k.shape[-2], v.shape[-1]
+    Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64}
     o = torch.empty_like(q)
     grid = (triton.cdiv(q.shape[2], BLOCK), q.shape[0] * q.shape[1], 1)
     L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
     m = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-    tmp = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
     num_warps = 4 if Lk <= 64 else 8
-    sm_scale = 1 / math.sqrt(q.shape[-1])
+    sm_scale = 1 / math.sqrt(q.size(-1))
 
     _fwd_kernel[grid](
         q, k, v, sm_scale,
-        L, m, tmp,
+        L, m,
         o,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -119,8 +109,13 @@ def flash_att_fwd(q, k, v):
     )
     return o
 
+def torch_fl_attention(q, k, v):
+    atten = q @ k.transpose(-2, -1) / math.sqrt(q.size(-1))
+    atten = torch.softmax(atten.float(), dim=-1).half()
+    return atten @ v
+
 if __name__ == '__main__':
-    shape = (2, 16, 64, 16)
+    shape = (8, 16, 64, 16)
     device = torch.device(0)
     requires_grad = False
     dtype = torch.float16
@@ -129,12 +124,17 @@ if __name__ == '__main__':
     v = torch.randn(shape, dtype=dtype, device=device, requires_grad=requires_grad)
 
     print('forward')
-    triton_out = flash_att_fwd(q, k.transpose(-2, -1), v)
+    #triton_out = flash_att_fwd(q, k.transpose(-2, -1), v)
+    triton_out = flash_att_fwd(q, k, v)
     print('out: ', triton_out.shape)
 
     #with torch.backends.cuda.enable_flash_sdp(True):
     #with torch.backends.cuda.sdp_kernel(enable_math=False):
-    #    torch_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    #torch_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    torch_out = torch_fl_attention(q, k, v)
+    assert torch.allclose(triton_out, torch_out, rtol=0.1, atol=0.1), (triton_out, torch_out)
 
-    #assert torch.allclose(triton_out, torch_out), (triton_out, torch_out)
+    #print('torch: ', triton.testing.do_bench(lambda: torch_fl_attention(q, k, v)))
+    #print('triton: ', triton.testing.do_bench(lambda: flash_att_fwd(q, k.transpose(-2, -1), v)))
+
 
