@@ -52,7 +52,9 @@ int LoadKernels() {
   void *handle = RTLD_DEFAULT;
 
   // get all kernel symbols from .so
-  for (int i = 0; i < 2; ++i) {
+  size_t size = sizeof(metadata) / sizeof(TritonKernelMetaData);
+  std::cout << "need to load size: " << size << std::endl;
+  for (int i = 0; i < size; ++i) {
     auto meta = metadata[i];
     char *buff = reinterpret_cast<char*>(dlsym(handle, meta.name_start));
     if (!buff) {
