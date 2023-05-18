@@ -150,6 +150,24 @@ def torch_grouped_gemm(list_a, b):
         list_c.append(c)
     return list_c
 
+def test_speed(M_list, K, N, device, dtype):
+    batch = len(M_list)
+    max_m = max(M_list)
+    aligned = 16
+    M = (max_m // aligned + 1) * aligned
+
+    # generate input data for triton
+    B = torch.randn(K, N, device=device, dtype=dtype)
+    A_triton = []
+    for m in M_list:
+        A_triton.append(torch.randn(m, K, device=device, dtype=dtype))
+
+    # generate aligned input data for torch
+    A_torch = torch.randn(batch, M, K, device=device, dtype=dtype)
+
+    print('torch: ', triton.testing.do_bench(lambda: torch.matmul(A_torch, B)))
+    print('triton: ', triton.testing.do_bench(lambda: triton_grouped_gemm(A_triton, B)))
+
 
 if __name__ == '__main__':
     batch=16
@@ -160,6 +178,7 @@ if __name__ == '__main__':
         m = random.randint(M_start, M_end)
         M.append(m)
 
+    print('M: ', M)
     K = 1024
     N = 512
 
@@ -181,10 +200,7 @@ if __name__ == '__main__':
             print('SAME')
         else:
             diff = abs(t1 - t2)
-            print('max diff: ', diff.max(), ' rel-diff: ', (diff / t2).max())
-            #print(t1)
-            #print(t2)
+            print('shape: ', t1.shape, 'max diff: ', diff.max(), ' rel-diff: ', (diff / t2).max())
 
-    print('torch: ', triton.testing.do_bench(lambda: torch_grouped_gemm(A_list, B)))
-    print('triton: ', triton.testing.do_bench(lambda: triton_grouped_gemm(A_list, B)))
+    test_speed(M, K, N, device, dtype)
 
