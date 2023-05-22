@@ -81,28 +81,52 @@ def grouped_gemm_kernel(block_aligned_array, num_of_M,
     tl.store(C, acc, mask=mask)
 
 
-def triton_grouped_gemm(list_a, b):
-    device = b.device
+def triton_grouped_gemm(array_trans_a, array_trans_b, array_alpha, array_a, array_b, array_beta, array_c):
+    """
+    grouped gemm's signature is (trans_a, trans_b
+                             vector<> m, vector<> n, vector<> k
+                             vector<> alpha,
+                             vector<> A, vector<> lda, vector<> B, vector<> ldb,
+                             vector<> beta,
+                             vector<> C, vector<> ldc,
+                             vector<> D, vector<> ldd,
+                             int gemm_count,
+                             )
+    where D[i] = alpha * A[i]*B[i] + beta * C[i], i = [0, gemm_count).
+    A,B,C,D are in column-major format, then lda, ldb is the number of elements in one line.
+
+    Here we use a list of tensor: array_a, array_b, array_c for vector of A, B, C pointers, and use the tensor shape for m, n, k
+
+    To simplify the problem, we do some assumptions:
+        1. all n in vector<> n are same, k in vector<> k are same, only m is variant. 
+        2. all tensor have same layout, then only need 1 trans_a and 1 trans_b
+        3. C has already been added into D with shape (m,n), so we compute C[i] = alpha * A[i]B[i] + beta *C[i]
+
+    """
     a = list_a[0]
-    # checks constraints
-    assert a.shape[1] == b.shape[0], "incompatible dimensions"
-    K, N = b.shape
+    device = a.device
+
+    K, N = array_b[0].shape
     # allocates output
     out_ptrs = []
+    trans_a = array_trans_a[0]
     a_ptrs = []
     m_sizes = []
-    am_strides = []
-    ak_strides = []
-    cm_strides = []
-    cn_strides = []
+    ldas = []
+    b_ptrs = []
+    trans_b = array_trans_b[0]
+    ldb = N if trans_b == 1 else K
+    c_ptrs = []
+    ldcs = []  # same as ldas
+
     block_aligned = []
     BLOCK_M = 64
     BLOCK_N = 128
     BLOCK_K = 32
 
-    list_c = []
+    array_d = []
 
-    for a in list_a:
+    for a,b,c in zip(array_a, array_b, array_c):
         M = a.shape[0]
         c = torch.zeros((M, N), device=device, dtype=a.dtype)
         list_c.append(c)
@@ -183,8 +207,8 @@ if __name__ == '__main__':
     N = 512
 
     device = torch.device(0)
-    #dtype = torch.float16
-    dtype = torch.float32
+    dtype = torch.float16
+    #dtype = torch.float32
     B = torch.randn(K, N, device=device, dtype=dtype)
 
     A_list = []
