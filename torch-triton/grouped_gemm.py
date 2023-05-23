@@ -22,12 +22,12 @@ def grouped_gemm_kernel(block_aligned_array, num_of_matrix,
         GROUP_M: tl.constexpr, EVEN_K: tl.constexpr,
     ):
     pid = tl.program_id(0)
+    DTYPE = tl.float32
     # search for A pointer, M, C pointer of current pid
     new_pid = pid
     A = tl.load(A_ptrs).to(tl.pointer_type(DTYPE))
     lda = tl.load(ldas)
     B = tl.load(B_ptrs).to(tl.pointer_type(DTYPE))
-    ldb = tl.load(ldbs)
     M = tl.load(M_array)
     C = tl.load(C_ptrs).to(tl.pointer_type(DTYPE))
     ldc = tl.load(ldcs)
@@ -43,7 +43,6 @@ def grouped_gemm_kernel(block_aligned_array, num_of_matrix,
             A = tl.load(A_ptrs + i).to(tl.pointer_type(DTYPE))
             lda = tl.load(ldas + i)
             B = tl.load(B_ptrs + i).to(tl.pointer_type(DTYPE))
-            ldb = tl.load(ldbs + i)
             M = tl.load(M_array + i)
             C = tl.load(C_ptrs + i).to(tl.pointer_type(DTYPE))
             ldc = tl.load(ldcs + i)
@@ -73,35 +72,59 @@ def grouped_gemm_kernel(block_aligned_array, num_of_matrix,
     rk = tl.arange(0, BLOCK_K)
     # pointers
     if TRANS_A == 1:
-        A = A + (ram[:, None] * lda + rk[None, :])
+        A = A + (ram[None, :] * lda + rk[:, None])  # KxM
     else:
-        A = A + (ram[None, :] * lda + rk[:, None])
+        A = A + (ram[None, :] + rk[:, None] * lda)  # KxM
 
     if TRANS_B == 1:
-        B = B + (rk[:, None] * ldb + rbn[None, :])
+        B = B + (rk[None, :] * ldb + rbn[:, None])  # NxK
     else:
-        B = B + (rk[None, :] * ldb + rbn[:, None])
+        B = B + (rk[None, :] + rbn[:, None] * ldb)  # NxK
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=ACC_DTYPE)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         if EVEN_K:
             a = tl.load(A)
             b = tl.load(B)
         else:
             k_remaining = K - k * BLOCK_K
-            a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.)
-            b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.)
-        acc += tl.dot(a, b)
-        A += BLOCK_K * stride_ak
-        B += BLOCK_K * stride_bk
+            if TRANS_A == 1:
+                a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.)
+            else:
+                a = tl.load(A, mask=rk[:, None] < k_remaining, other=0.)
 
-    acc = acc.to(C.dtype.element_ty)
+            if TRANS_B == 1:
+                b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.)
+            else:
+                b = tl.load(B, mask=rk[None, :] < k_remaining, other=0.)
+
+        # do compute
+        acc += tl.dot(b, a)
+
+        if TRANS_A == 1:
+            A += BLOCK_K
+        else:
+            A += BLOCK_K * lda
+
+        if TRANS_B == 1:
+            B += BLOCK_K * ldb
+        else:
+            B += BLOCK_K
+
+
     # rematerialize rm and rn to save registers
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    C = C + (rm[None, :] * ldc + rn[:, None])
+    C = C + (rm[None, :] + rn[:, None] * ldc)
     mask = (rm < M)[None, :] & (rn < N)[:, None]
-    tl.store(C, acc, mask=mask)
+    c = tl.load(C, mask=mask)
+
+    # compute alpha * AB + beta * C
+    acc = acc * alpha + beta * c
+
+    acc = acc.to(D.dtype.element_ty)
+    D = D + (rm[None, :] + rn[:, None] * ldd)
+    tl.store(D, acc, mask=mask)
 
 
 def triton_grouped_gemm(array_trans_a, array_trans_b, array_alpha, array_a, array_b, array_beta, array_c):
@@ -135,7 +158,7 @@ def triton_grouped_gemm(array_trans_a, array_trans_b, array_alpha, array_a, arra
     ldas = []
     b_ptrs = []
     c_ptrs = []
-    ldcs = []  # same as ldas
+    ldcs = []
 
     trans_a = array_trans_a[0]
     trans_b = array_trans_b[0]
@@ -155,7 +178,7 @@ def triton_grouped_gemm(array_trans_a, array_trans_b, array_alpha, array_a, arra
         lda = a.shape[1] if trans_a == 0 else a.shape[0]
         a_ptrs.append(a.data_ptr())
         m_sizes.append(M)
-        ldas.append(lda)
+        ldas.append(M)
         b_ptrs.append(b.data_ptr())
         c_ptrs.append(c.data_ptr())
 
@@ -183,7 +206,7 @@ def triton_grouped_gemm(array_trans_a, array_trans_b, array_alpha, array_a, arra
                   beta_tensor,
                   c_ptrs_tensor, ldas_tensor,  # ldc is same as lda, use ldas for ldcs
                   c_ptrs_tensor, ldas_tensor,  # re-use c_ptr as output d ptr.
-                  DTYPE=tl.float32 if array_a[0].dtype == torch.float32 else tl.float16,
+                  DTYPE=tl.float32, #if array_a[0].dtype == torch.float32 else tl.float16,
                   ACC_DTYPE=tl.float32,
                   TRANS_A=trans_a, TRANS_B=trans_b,  # 0 for N, 1 for T
                   BLOCK_M=BLOCK_M,
@@ -194,6 +217,31 @@ def triton_grouped_gemm(array_trans_a, array_trans_b, array_alpha, array_a, arra
                   )
     return array_c
 
+def triton_groupedgemm_wrap(list_a, b):
+    array_trans_a = []
+    array_trans_b = []
+    array_alpha = []
+    array_a = []
+    array_b = []
+    array_beta = []
+    array_c = []
+    for a in list_a:
+      array_trans_a.append(1)
+      array_trans_b.append(1)
+      array_alpha.append(1.0)
+      array_a.append(a)
+      array_b.append(b)
+      array_beta.append(0.0)
+      M,K = a.shape[0], a.shape[1]
+      K1,N = b.shape[0], b.shape[1]
+      assert K == K1
+      c = torch.zeros((M, N), device=a.device, dtype=a.dtype)
+      array_c.append(c)
+
+    # T(C=AB) ==> T(C) = T(B) * T(A)
+    triton_grouped_gemm(array_trans_b, array_trans_a, array_alpha, array_b, array_a, array_beta, array_c)
+
+    return array_c
 
 def torch_grouped_gemm(list_a, b):
     list_c = []
@@ -218,13 +266,13 @@ def test_speed(M_list, K, N, device, dtype):
     A_torch = torch.randn(batch, M, K, device=device, dtype=dtype)
 
     print('torch: ', triton.testing.do_bench(lambda: torch.matmul(A_torch, B)))
-    print('triton: ', triton.testing.do_bench(lambda: triton_grouped_gemm(A_triton, B)))
+    print('triton: ', triton.testing.do_bench(lambda: triton_groupedgemm_wrap(A_triton, B)))
 
 
 if __name__ == '__main__':
-    batch=16
+    batch=2
     M_start = 128
-    M_end = 4096
+    M_end = 256
     M = []
     for i in range(batch):
         m = random.randint(M_start, M_end)
@@ -235,8 +283,8 @@ if __name__ == '__main__':
     N = 512
 
     device = torch.device(0)
-    dtype = torch.float16
-    #dtype = torch.float32
+    #dtype = torch.float16
+    dtype = torch.float32
     B = torch.randn(K, N, device=device, dtype=dtype)
 
     A_list = []
@@ -245,8 +293,9 @@ if __name__ == '__main__':
         A_list.append(a)
 
     # compare results
-    triton_res = triton_grouped_gemm(A_list, B)
+    triton_res = triton_groupedgemm_wrap(A_list, B)
     torch_res = torch_grouped_gemm(A_list, B)
+    print(triton_res)
     for t1, t2 in zip(triton_res, torch_res):
         if torch.allclose(t1, t2):
             print('SAME')
@@ -254,5 +303,5 @@ if __name__ == '__main__':
             diff = abs(t1 - t2)
             print('shape: ', t1.shape, 'max diff: ', diff.max(), ' rel-diff: ', (diff / t2).max())
 
-    test_speed(M, K, N, device, dtype)
+    #test_speed(M, K, N, device, dtype)
 
