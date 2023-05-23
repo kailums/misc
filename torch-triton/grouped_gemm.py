@@ -7,37 +7,51 @@ import random
 
 
 @triton.jit
-def grouped_gemm_kernel(block_aligned_array, num_of_M,
-        A_ptrs, B, C_ptrs,
+def grouped_gemm_kernel(block_aligned_array, num_of_matrix,
         M_array, N, K,
-        stride_am_array, stride_ak_array,
-        stride_bk, stride_bn,
-        stride_cm_array, stride_cn_array,
+        array_alpha,
+        A_ptrs, ldas,
+        B_ptrs, ldb,
+        array_beta,
+        C_ptrs, ldcs,
+        D_ptrs, ldds,
+        DTYPE: tl.constexpr,
+        ACC_DTYPE: tl.constexpr,
+        TRANS_A: tl.constexpr, TRANS_B: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr, EVEN_K: tl.constexpr,
     ):
     pid = tl.program_id(0)
     # search for A pointer, M, C pointer of current pid
     new_pid = pid
-    A = tl.load(A_ptrs).to(tl.pointer_type(B.dtype.element_ty))
+    A = tl.load(A_ptrs).to(tl.pointer_type(DTYPE))
+    lda = tl.load(ldas)
+    B = tl.load(B_ptrs).to(tl.pointer_type(DTYPE))
+    ldb = tl.load(ldbs)
     M = tl.load(M_array)
-    C = tl.load(C_ptrs).to(tl.pointer_type(B.dtype.element_ty))
-    stride_am = tl.load(stride_am_array)
-    stride_ak = tl.load(stride_ak_array)
-    stride_cm = tl.load(stride_cm_array)
-    stride_cn = tl.load(stride_cn_array)
+    C = tl.load(C_ptrs).to(tl.pointer_type(DTYPE))
+    ldc = tl.load(ldcs)
+    D = tl.load(D_ptrs).to(tl.pointer_type(DTYPE))
+    ldd = tl.load(ldds)
+    alpha = tl.load(array_alpha)
+    beta = tl.load(array_beta)
 
-    for i in range(0, num_of_M):
+    for i in range(0, num_of_matrix):
         b_size = tl.load(block_aligned_array + i)
         if pid >= 0 and pid < b_size:
             # found
-            A = tl.load(A_ptrs + i).to(tl.pointer_type(B.dtype.element_ty))
+            A = tl.load(A_ptrs + i).to(tl.pointer_type(DTYPE))
+            lda = tl.load(ldas + i)
+            B = tl.load(B_ptrs + i).to(tl.pointer_type(DTYPE))
+            ldb = tl.load(ldbs + i)
             M = tl.load(M_array + i)
-            C = tl.load(C_ptrs + i).to(tl.pointer_type(B.dtype.element_ty))
-            stride_am = tl.load(stride_am_array + i)
-            stride_ak = tl.load(stride_ak_array + i)
-            stride_cm = tl.load(stride_cm_array + i)
-            stride_cn = tl.load(stride_cn_array + i)
+            C = tl.load(C_ptrs + i).to(tl.pointer_type(DTYPE))
+            ldc = tl.load(ldcs + i)
+            D = tl.load(D_ptrs + i).to(tl.pointer_type(DTYPE))
+            ldd = tl.load(ldds + i)
+            alpha = tl.load(array_alpha + i)
+            beta = tl.load(array_beta + i)
+
             new_pid = pid
         pid -= b_size
 
@@ -58,8 +72,16 @@ def grouped_gemm_kernel(block_aligned_array, num_of_M,
     rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
     # pointers
-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
+    if TRANS_A == 1:
+        A = A + (ram[:, None] * lda + rk[None, :])
+    else:
+        A = A + (ram[None, :] * lda + rk[:, None])
+
+    if TRANS_B == 1:
+        B = B + (rk[:, None] * ldb + rbn[None, :])
+    else:
+        B = B + (rk[None, :] * ldb + rbn[:, None])
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         if EVEN_K:
@@ -72,12 +94,13 @@ def grouped_gemm_kernel(block_aligned_array, num_of_M,
         acc += tl.dot(a, b)
         A += BLOCK_K * stride_ak
         B += BLOCK_K * stride_bk
+
     acc = acc.to(C.dtype.element_ty)
     # rematerialize rm and rn to save registers
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
-    mask = (rm < M)[:, None] & (rn < N)[None, :]
+    C = C + (rm[None, :] * ldc + rn[:, None])
+    mask = (rm < M)[None, :] & (rn < N)[:, None]
     tl.store(C, acc, mask=mask)
 
 
@@ -103,21 +126,22 @@ def triton_grouped_gemm(array_trans_a, array_trans_b, array_alpha, array_a, arra
         3. C has already been added into D with shape (m,n), so we compute C[i] = alpha * A[i]B[i] + beta *C[i]
 
     """
-    a = list_a[0]
+    a = array_a[0]
     device = a.device
 
-    K, N = array_b[0].shape
     # allocates output
-    out_ptrs = []
-    trans_a = array_trans_a[0]
     a_ptrs = []
     m_sizes = []
     ldas = []
     b_ptrs = []
-    trans_b = array_trans_b[0]
-    ldb = N if trans_b == 1 else K
     c_ptrs = []
     ldcs = []  # same as ldas
+
+    trans_a = array_trans_a[0]
+    trans_b = array_trans_b[0]
+    K = array_b[0].shape[0] if trans_b == 0 else array_b[0].shape[1]
+    N = array_b[0].shape[1] if trans_b == 0 else array_b[0].shape[0]
+    ldb = N if trans_b == 1 else K
 
     block_aligned = []
     BLOCK_M = 64
@@ -127,44 +151,48 @@ def triton_grouped_gemm(array_trans_a, array_trans_b, array_alpha, array_a, arra
     array_d = []
 
     for a,b,c in zip(array_a, array_b, array_c):
-        M = a.shape[0]
-        c = torch.zeros((M, N), device=device, dtype=a.dtype)
-        list_c.append(c)
-        out_ptrs.append(c.data_ptr())
+        M = a.shape[0] if trans_a == 0 else a.shape[1]
+        lda = a.shape[1] if trans_a == 0 else a.shape[0]
         a_ptrs.append(a.data_ptr())
         m_sizes.append(M)
-        am_strides.append(a.stride(0))
-        ak_strides.append(a.stride(1))
-        cm_strides.append(c.stride(0))
-        cn_strides.append(c.stride(1))
+        ldas.append(lda)
+        b_ptrs.append(b.data_ptr())
+        c_ptrs.append(c.data_ptr())
+
         block_aligned.append(triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N))
 
     # convert list into cuda tensors
-    out_ptrs_tensor = torch.tensor(tuple(out_ptrs), dtype=torch.int64, device=device)
     a_ptrs_tensor = torch.tensor(tuple(a_ptrs), dtype=torch.int64, device=device)
     m_sizes_tensor = torch.tensor(tuple(m_sizes), dtype=torch.int32, device=device)
-    am_strides_tensor = torch.tensor(tuple(am_strides), dtype=torch.int64, device=device)
-    ak_strides_tensor = torch.tensor(tuple(ak_strides), dtype=torch.int64, device=device)
-    cm_strides_tensor = torch.tensor(tuple(cm_strides), dtype=torch.int64, device=device)
-    cn_strides_tensor = torch.tensor(tuple(cn_strides), dtype=torch.int64, device=device)
+    alpha_tensor = torch.tensor(tuple(array_alpha), dtype=torch.float32, device=device)
+    beta_tensor = torch.tensor(tuple(array_beta), dtype=torch.float32, device=device)
+    ldas_tensor = torch.tensor(tuple(ldas), dtype=torch.int32, device=device)
+    b_ptrs_tensor = torch.tensor(tuple(b_ptrs), dtype=torch.int64, device=device)
+    c_ptrs_tensor = torch.tensor(tuple(c_ptrs), dtype=torch.int64, device=device)
+
     block_aligned_tensor = torch.tensor(tuple(block_aligned), dtype=torch.int32, device=device)
 
     # launch kernel
     #grid = lambda META: (triton.cdiv(m_sizes[0], META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
     grid = (sum(block_aligned), )
-    grouped_gemm_kernel[grid](block_aligned_tensor, len(list_a),
-                  a_ptrs_tensor, b, out_ptrs_tensor, 
+    grouped_gemm_kernel[grid](block_aligned_tensor, len(array_a),
                   m_sizes_tensor, N, K,
-                  am_strides_tensor, ak_strides_tensor,
-                  b.stride(0), b.stride(1),
-                  cm_strides_tensor, cn_strides_tensor,
+                  alpha_tensor,
+                  a_ptrs_tensor, ldas_tensor,
+                  b_ptrs_tensor, ldb,
+                  beta_tensor,
+                  c_ptrs_tensor, ldas_tensor,  # ldc is same as lda, use ldas for ldcs
+                  c_ptrs_tensor, ldas_tensor,  # re-use c_ptr as output d ptr.
+                  DTYPE=tl.float32 if array_a[0].dtype == torch.float32 else tl.float16,
+                  ACC_DTYPE=tl.float32,
+                  TRANS_A=trans_a, TRANS_B=trans_b,  # 0 for N, 1 for T
                   BLOCK_M=BLOCK_M,
                   BLOCK_N=BLOCK_N,
                   BLOCK_K=BLOCK_K,
                   GROUP_M=8,
                   EVEN_K=int(K % BLOCK_K == 0),
                   )
-    return list_c
+    return array_c
 
 
 def torch_grouped_gemm(list_a, b):
