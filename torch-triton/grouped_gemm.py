@@ -184,7 +184,7 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
 
     block_aligned = []
     BLOCK_M = 32
-    BLOCK_N = 128
+    BLOCK_N = 128 if a.dtype == torch.float16 else 64
     BLOCK_K = 64
 
     array_d = []
@@ -256,7 +256,7 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
                   )
     return array_c
 
-def triton_groupedgemm_wrap(list_a, b):
+def triton_groupedgemm_wrap(list_a, list_b):
     """
     list_a is a list of tensor a, with shape MxK, where M may be different.
     b is a tensor, with shape KxN.
@@ -266,7 +266,7 @@ def triton_groupedgemm_wrap(list_a, b):
     array_b = []
     array_beta = []
     array_c = []
-    for a in list_a:
+    for a,b in zip(list_a, list_b):
       array_alpha.append(1.0)
       array_a.append(a)
       array_b.append(b)
@@ -281,42 +281,49 @@ def triton_groupedgemm_wrap(list_a, b):
 
     return array_c
 
-def torch_grouped_gemm(list_a, b):
+def torch_grouped_gemm(list_a, list_b):
     list_c = []
-    for a in list_a:
+    for a, b in zip(list_a, list_b):
         c = torch.matmul(a, b)
         list_c.append(c)
     return list_c
 
-def test_speed(M_list, K, N, device, dtype):
-    batch = len(M_list)
-    max_m = max(M_list)
-    aligned = 16
-    M = (max_m // aligned + 1) * aligned
-
+def test_speed(mnk_array, device, dtype):
+    a_list = []
+    b_list = []
+    max_m, max_n, max_k = 0, 0, 0
     # generate input data for triton
-    B = torch.randn(K, N, device=device, dtype=dtype)
-    A_triton = []
-    for m in M_list:
-        A_triton.append(torch.randn(m, K, device=device, dtype=dtype))
+    for (m, n, k) in mnk_array:
+        a_list.append(torch.randn(m, k, device=device, dtype=dtype))
+        b_list.append(torch.randn(k, n, device=device, dtype=dtype))
+        max_m = max(max_m, m)
+        max_n = max(max_n, n)
+        max_k = max(max_k, k)
+
+    batch = len(a_list)
+    aligned = 16
+    max_m = (max_m // aligned + 1) * aligned
+    max_n = (max_n // aligned + 1) * aligned
+    max_k = (max_k // aligned + 1) * aligned
 
     # generate aligned input data for torch
-    A_torch = torch.randn(batch, M, K, device=device, dtype=dtype)
+    A_torch = torch.randn(batch, max_m, max_k, device=device, dtype=dtype)
+    B_torch = torch.randn(batch, max_k, max_n, device=device, dtype=dtype)
 
-    print('torch: ', triton.testing.do_bench(lambda: torch.matmul(A_torch, B)))
-    print('triton: ', triton.testing.do_bench(lambda: triton_groupedgemm_wrap(A_triton, B)))
+    print('torch: ', triton.testing.do_bench(lambda: torch.matmul(A_torch, B_torch)))
+    print('triton: ', triton.testing.do_bench(lambda: triton_groupedgemm_wrap(a_list, b_list)))
 
-def compare(M, K, N, device, dtype):
-    B = torch.randn(K, N, device=device, dtype=dtype)
-
-    A_list = []
-    for m in M:
-        a = torch.randn(m, K, device=device, dtype=dtype)
-        A_list.append(a)
+def compare(mnk_array, device, dtype):
+    a_list = []
+    b_list = []
+    # generate input data for triton
+    for (m, n, k) in mnk_array:
+        a_list.append(torch.randn(m, k, device=device, dtype=dtype))
+        b_list.append(torch.randn(k, n, device=device, dtype=dtype))
 
     # compare results
-    triton_res = triton_groupedgemm_wrap(A_list, B)
-    torch_res = torch_grouped_gemm(A_list, B)
+    triton_res = triton_groupedgemm_wrap(a_list, b_list)
+    torch_res = torch_grouped_gemm(a_list, b_list)
     for t1, t2 in zip(triton_res, torch_res):
         if torch.allclose(t1, t2):
             print('dtype: ', dtype, ' shape: ', t1.shape, ' SAME')
@@ -332,20 +339,27 @@ if __name__ == '__main__':
     M_start = 64
     M_end = 4096
     M = []
-    for i in range(batch):
-        m = random.randint(M_start, M_end)
-        M.append(m)
-
-    print('M: ', M)
     N = 2048
     K = 1024
+    row1 = []
+    for i in range(batch):
+        m = random.randint(M_start, M_end)
+        row1.append([m, N, K])
+
+    row2 = [[768,1,4608], [768,1,4608]]
+    row3 = [[4608,1,384], [4608,1,384]]
+    row6 = [ [ 768, 2, 4608], [ 768, 1, 4608], [ 768, 1, 4608], [ 768, 1, 4608], [ 768, 1, 4608], [ 768, 1, 4608], [ 768, 3, 4608], [ 768, 4, 4608], [ 768, 3, 4608], [ 768, 5, 4608], [ 768, 2, 4608], [ 768, 4, 4608], [ 768, 2, 4608], [ 768, 1, 4608], [ 768, 1, 4608]]
+    row7 = [[4608, 2, 384], [4608, 1, 384], [4608, 1, 384], [4608, 1, 384], [4608, 1, 384], [4608, 1, 384], [4608, 3, 384], [4608, 4, 384], [4608, 3, 384], [4608, 5, 384], [4608, 2, 384], [4608, 4, 384], [4608, 2, 384], [4608, 1, 384], [4608, 1, 384]]
+    row8 = [[768, 167, 4608], [768, 183, 4608], [768, 177, 4608], [768, 181, 4608], [768, 153, 4608], [768, 139, 4608], [768, 156, 4608], [768, 173, 4608], [768, 163, 4608], [768, 150, 4608], [768, 204, 4608], [768, 184, 4608], [768, 168, 4608], [768, 156, 4608], [768, 168, 4608], [768, 148, 4608]]
+    row9 = [[4608, 167, 384], [4608, 183, 384], [4608, 177, 384], [4608, 181, 384], [4608, 153, 384], [4608, 139, 384], [4608, 156, 384], [4608, 173, 384], [4608, 163, 384], [4608, 150, 384], [4608, 204, 384], [4608, 184, 384], [4608, 168, 384], [4608, 156, 384], [4608, 168, 384], [4608, 148, 384]]
 
     device = torch.device(0)
     torch.cuda.manual_seed(42)
     dtype = torch.float16
     #dtype = torch.float32
 
-    #compare(M, K, N, device, dtype)
-
-    test_speed(M, K, N, device, dtype)
+    for i, mnk in enumerate([row2, row3, row6, row7, row8, row9]):
+        print('test row ', i)
+        #compare(mnk, device, dtype)
+        test_speed(mnk, device, dtype)
 
