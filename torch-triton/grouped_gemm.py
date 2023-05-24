@@ -6,6 +6,14 @@ import triton.language as tl
 import random
 
 
+#@triton.autotune(
+#    configs=[
+#       triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
+#    ]
+#)
+@triton.heuristics({
+    'EVEN_K': lambda args: args['K'] % args['BLOCK_K'] == 0,
+})
 @triton.jit
 def grouped_gemm_kernel(block_aligned_array, num_of_matrix,
         m_array, n_array, K,
@@ -176,8 +184,8 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
 
     block_aligned = []
     BLOCK_M = 32
-    BLOCK_N = 64
-    BLOCK_K = 32
+    BLOCK_N = 128
+    BLOCK_K = 64
 
     array_d = []
 
@@ -214,8 +222,20 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
 
     # T(C=AB) ==> T(C) = T(B) * T(A), column-major
     # launch kernel
-    #grid = lambda META: (triton.cdiv(m_sizes[0], META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
-    grid = (sum(block_aligned), )
+    def get_grid(**kwargs):
+        m_sizes_tensor = kwargs['m_array']
+        n_sizes_tensor = kwargs['n_array']
+        BLOCK_M = kwargs['BLOCK_M']
+        BLOCK_N = kwargs['BLOCK_N']
+        num = kwargs['num_of_matrix']
+
+        ret = 0
+        m = (m_sizes_tensor / BLOCK_M).ceil().to(torch.int32)
+        n = (n_sizes_tensor / BLOCK_N).ceil().to(torch.int32)
+        ret = sum(m * n)
+        
+        return (ret,)
+    grid = lambda META: get_grid(**META)
     grouped_gemm_kernel[grid](block_aligned_tensor, len(array_a),
                   n_sizes_tensor, m_sizes_tensor, K,
                   alpha_tensor,
@@ -230,8 +250,9 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
                   BLOCK_M=BLOCK_N,
                   BLOCK_N=BLOCK_M,
                   BLOCK_K=BLOCK_K,
-                  GROUP_M=2,
-                  EVEN_K=int(K % BLOCK_K == 0),
+                  GROUP_M=8,
+                  #EVEN_K=int(K % BLOCK_K == 0),
+                  #num_warps=8,
                   )
     return array_c
 
@@ -324,7 +345,7 @@ if __name__ == '__main__':
     dtype = torch.float16
     #dtype = torch.float32
 
-    compare(M, K, N, device, dtype)
+    #compare(M, K, N, device, dtype)
 
     test_speed(M, K, N, device, dtype)
 
