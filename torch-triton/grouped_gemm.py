@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 
 import random
+import argparse
 
 
 #@triton.autotune(
@@ -333,8 +334,17 @@ def compare(mnk_array, device, dtype):
             #print('triton: ', t1)
             #print('torch: ', t2)
 
+def get_arges():
+    parser = argparse.ArgumentParser(description="PyTorch Template Finetune Example")
+    parser.add_argument('--fp16', action='store_true', default=False)
+    parser.add_argument('--compare', action='store_true', default=False)
+
+    args = parser.parse_args()
+    return args
+
 
 if __name__ == '__main__':
+    args = get_arges()
     batch=16
     M_start = 64
     M_end = 4096
@@ -355,11 +365,13 @@ if __name__ == '__main__':
 
     device = torch.device(0)
     torch.cuda.manual_seed(42)
-    dtype = torch.float16
-    #dtype = torch.float32
+    dtype = torch.float32
+    if args.fp16:
+        dtype = torch.float16
 
     for i, mnk in enumerate([row2, row3, row6, row7, row8, row9]):
         print('test row ', i)
-        #compare(mnk, device, dtype)
+        if args.compare:
+            compare(mnk, device, dtype)
         test_speed(mnk, device, dtype)
 
