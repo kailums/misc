@@ -21,6 +21,9 @@ from mpi4py import MPI
 op_domain_ms = Opset("com.microsoft", 1)
 op_domain_custom = Opset("com.custom", 1)
 
+# TODO: need to create this onnx domain for LayerNorm, otherwise it will raise error for can't find LayerNorm in ort.
+op_domain_onnx = Opset("", 1)
+
 # We use the script decorator to indicate that
 # this is meant to be translated to ONNX.
 @script(op_domain_ms)
@@ -28,7 +31,7 @@ def AllReduce(X):
     """use AllReduce from ms domain."""
     return op.Identity(X)
 
-@script()
+@script(op_domain_onnx)
 def LayerNormalization(x, scale, bias=None, axis: int=-1, epsilon: float=1e-5, stash_type: int=1):
     """ 
     layernorm is in onnx opset17, this function will call into onnxruntime.
@@ -120,7 +123,7 @@ def setup_session_option(args, local_rank):
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.intra_op_num_threads = psutil.cpu_count(logical=False)
     so.log_severity_level = 4 # 0 for verbose
-    if local_rank == 0 and args.debug:
+    if local_rank == 0 and args.log:
         so.log_severity_level = 0
         ort.set_default_logger_severity(0)  # open log
 
@@ -130,6 +133,9 @@ def setup_session_option(args, local_rank):
     if args.profile:
         so.enable_profiling = args.profile
         so.profile_file_prefix=f'ort-profile-rank{local_rank}'
+
+    custom_op_lib_path = "librocm_custom_op_library.so"
+    so.register_custom_ops_library(custom_op_lib_path)
 
     return so
 
@@ -225,7 +231,7 @@ def get_arges():
     parser.add_argument('--fp16', action='store_true', default=False)
     parser.add_argument('--tune', action='store_true', default=False)
     parser.add_argument('--ort-opt', action='store_true', default=False)
-    parser.add_argument('--debug', action='store_true', default=False)
+    parser.add_argument('--log', action='store_true', default=False)
 
     args = parser.parse_args()
     return args

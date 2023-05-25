@@ -70,7 +70,8 @@ def _kernel(A, B, C, M, N, K,
             k_remaining = K - k * (BLOCK_K * SPLIT_K)
             a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.)
             b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.)
-        acc += tl.dot(a, b, out_dtype=dot_out_dtype)
+        #acc += tl.dot(a, b, out_dtype=dot_out_dtype)
+        acc += tl.dot(a, b)
         A += BLOCK_K * SPLIT_K * stride_ak
         B += BLOCK_K * SPLIT_K * stride_bk
     acc = acc.to(C.dtype.element_ty)
@@ -161,6 +162,7 @@ if __name__ == '__main__':
           ]
     for M, N, K in MNK:
         dtype = torch.float16
+        #dtype = torch.float32
         quantiles = [0.5, 0.2, 0.8]
         x = torch.randn(M, K, device='cuda', dtype=dtype)
         y = torch.randn(K, N, device='cuda', dtype=dtype)
