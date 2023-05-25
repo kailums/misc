@@ -9,6 +9,7 @@ MPI="mpirun --allow-run-as-root -mca btl_openib_warn_no_device_params_found 0 -m
 #PROF='nsys profile -o triton-matmul -f true --trace=cuda,nvtx,cublas,cudnn '
 #PROF='/opt/nvidia/nsight-compute/2023.1.1/ncu -o triton -f '
 #PROF='/opt/nvidia/nsight-compute/2023.1.1/ncu -k regex:gemm --print-summary=per-kernel '
+PROF="rocprof -d rocp --timestamp on --hip-trace --roctx-trace --roctx-rename "
 
 #$PROF python matmul.py
-$PROF python grouped_gemm.py
+$PROF python grouped_gemm.py --compare

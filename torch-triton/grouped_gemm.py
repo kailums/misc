@@ -338,6 +338,7 @@ def get_arges():
     parser = argparse.ArgumentParser(description="PyTorch Template Finetune Example")
     parser.add_argument('--fp16', action='store_true', default=False)
     parser.add_argument('--compare', action='store_true', default=False)
+    parser.add_argument('--speed', action='store_true', default=False)
 
     args = parser.parse_args()
     return args
@@ -373,5 +374,6 @@ if __name__ == '__main__':
         print('test row ', i)
         if args.compare:
             compare(mnk, device, dtype)
-        test_speed(mnk, device, dtype)
+        if args.speed:
+            test_speed(mnk, device, dtype)
 
