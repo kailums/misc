@@ -5,18 +5,32 @@ import triton.language as tl
 
 import random
 import argparse
+from triton.ops import matmul
+
+import sys
+if os.path.exists("/ws/work/pytorch_grouped_gemm/build"):
+    sys.path.append("/ws/work/pytorch_grouped_gemm/build")
+    import PYTORCH_GROUPED_GEMM
+else:
+    PYTORCH_GROUPED_GEMM = None
 
 
-#@triton.autotune(
-#    configs=[
-#       triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-#    ]
-#)
+@triton.autotune(
+    configs=[
+       #triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 16, 'GROUP_M': 2}, num_stages=3, num_warps=8),
+       #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=32),
+       #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=16),
+       triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+       triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+       triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+    ],
+    key=['K'],
+)
 @triton.heuristics({
     'EVEN_K': lambda args: args['K'] % args['BLOCK_K'] == 0,
 })
 @triton.jit
-def grouped_gemm_kernel(block_aligned_array, num_of_matrix,
+def grouped_gemm_kernel(num_of_matrix,
         m_array, n_array, K,
         array_alpha,
         a_ptrs, ldas,
@@ -31,6 +45,7 @@ def grouped_gemm_kernel(block_aligned_array, num_of_matrix,
         GROUP_M: tl.constexpr, EVEN_K: tl.constexpr,
     ):
     pid = tl.program_id(0)
+    num_pids = tl.num_programs(0)
 
     # reset DTYPE, because it is tl.constexpr, can't be used in tl.pointer_type
     if DTYPE == tl.constexpr(tl.float16):
@@ -39,111 +54,97 @@ def grouped_gemm_kernel(block_aligned_array, num_of_matrix,
         DTYPE = tl.float32
 
     # search for A pointer, M, C pointer of current pid
-    new_pid = pid
-    A = tl.load(a_ptrs).to(tl.pointer_type(DTYPE))
-    lda = tl.load(ldas)
-    B = tl.load(b_ptrs).to(tl.pointer_type(DTYPE))
-    ldb = tl.load(ldbs)
-    M = tl.load(m_array)
-    N = tl.load(n_array)
-    C = tl.load(c_ptrs).to(tl.pointer_type(DTYPE))
-    ldc = tl.load(ldcs)
-    D = tl.load(d_ptrs).to(tl.pointer_type(DTYPE))
-    ldd = tl.load(ldds)
-    alpha = tl.load(array_alpha)
-    beta = tl.load(array_beta)
-
     for i in range(0, num_of_matrix):
-        b_size = tl.load(block_aligned_array + i)
+        M = tl.load(m_array + i)
+        N = tl.load(n_array + i)
+        grid_m = tl.cdiv(M, BLOCK_M)
+        grid_n = tl.cdiv(N, BLOCK_N)
+
+        b_size = grid_m * grid_n
+
         if pid >= 0 and pid < b_size:
             # found
             A = tl.load(a_ptrs + i).to(tl.pointer_type(DTYPE))
             lda = tl.load(ldas + i)
             B = tl.load(b_ptrs + i).to(tl.pointer_type(DTYPE))
             ldb = tl.load(ldbs + i)
-            M = tl.load(m_array + i)
-            N = tl.load(n_array + i)
             C = tl.load(c_ptrs + i).to(tl.pointer_type(DTYPE))
             ldc = tl.load(ldcs + i)
             D = tl.load(d_ptrs + i).to(tl.pointer_type(DTYPE))
             ldd = tl.load(ldds + i)
             alpha = tl.load(array_alpha + i)
             beta = tl.load(array_beta + i)
-            # save new pid
-            new_pid = pid
 
-        pid -= b_size
-
-    pid = new_pid
-    # matrix multiplication
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_n = tl.cdiv(N, BLOCK_N)
-    # re-order program ID for better L2 performance
-    width = GROUP_M * grid_m
-    group_id = pid // width
-    group_size = min(grid_n - group_id * GROUP_M, GROUP_M)
-    pid_n = group_id * GROUP_M + (pid % group_size)
-    pid_m = (pid % width) // (group_size)
-    # do matrix multiplication
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-    rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    # pointers
-    if TRANS_A == 1:
-        A = A + (ram[None, :] * lda + rk[:, None])  # KxM
-    else:
-        A = A + (ram[None, :] + rk[:, None] * lda)  # KxM
-
-    if TRANS_B == 1:
-        B = B + (rk[None, :] * ldb + rbn[:, None])  # NxK
-    else:
-        B = B + (rk[None, :] + rbn[:, None] * ldb)  # NxK
-
-    acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=ACC_DTYPE)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        if EVEN_K:
-            a = tl.load(A)
-            b = tl.load(B)
-        else:
-            k_remaining = K - k * BLOCK_K
+            # matrix multiplication
+            # re-order program ID for better L2 performance
+            width = GROUP_M * grid_m
+            group_id = pid // width
+            group_size = min(grid_n - group_id * GROUP_M, GROUP_M)
+            pid_n = group_id * GROUP_M + (pid % group_size)
+            pid_m = (pid % width) // (group_size)
+            # do matrix multiplication
+            rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+            rk = tl.arange(0, BLOCK_K)
+            # pointers
             if TRANS_A == 1:
-                a = tl.load(A, mask=rk[:, None] < k_remaining, other=0.)
+                A = A + (ram[None, :] * lda + rk[:, None])  # KxM
             else:
-                a = tl.load(A, mask=rk[:, None] < k_remaining, other=0.)
-
+                A = A + (ram[None, :] + rk[:, None] * lda)  # KxM
+        
             if TRANS_B == 1:
-                b = tl.load(B, mask=rk[None, :] < k_remaining, other=0.)
+                B = B + (rk[None, :] * ldb + rbn[:, None])  # NxK
             else:
-                b = tl.load(B, mask=rk[None, :] < k_remaining, other=0.)
-
-        # do compute
-        acc += tl.dot(b, a)
-
-        if TRANS_A == 1:
-            A += BLOCK_K
-        else:
-            A += BLOCK_K * lda
-
-        if TRANS_B == 1:
-            B += BLOCK_K * ldb
-        else:
-            B += BLOCK_K
-
-    # rematerialize rm and rn to save registers
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    C = C + (rm[None, :] + rn[:, None] * ldc)
-    mask = (rm < M)[None, :] & (rn < N)[:, None]
-    c = tl.load(C, mask=mask)
-
-    # compute alpha * AB + beta * C
-    acc = acc * alpha + beta * c
-
-    acc = acc.to(D.dtype.element_ty)
-    D = D + (rm[None, :] + rn[:, None] * ldd)
-    tl.store(D, acc, mask=mask)
+                B = B + (rk[None, :] + rbn[:, None] * ldb)  # NxK
+        
+            acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=ACC_DTYPE)
+            for k in range(0, tl.cdiv(K, BLOCK_K)):
+                if EVEN_K:
+                    a = tl.load(A)
+                    b = tl.load(B)
+                else:
+                    k_remaining = K - k * BLOCK_K
+                    if TRANS_A == 1:
+                        a = tl.load(A, mask=rk[:, None] < k_remaining, other=0.)
+                    else:
+                        a = tl.load(A, mask=rk[:, None] < k_remaining, other=0.)
+        
+                    if TRANS_B == 1:
+                        b = tl.load(B, mask=rk[None, :] < k_remaining, other=0.)
+                    else:
+                        b = tl.load(B, mask=rk[None, :] < k_remaining, other=0.)
+        
+                # do compute
+                acc += tl.dot(b, a)
+        
+                if TRANS_A == 1:
+                    A += BLOCK_K
+                else:
+                    A += BLOCK_K * lda
+        
+                if TRANS_B == 1:
+                    B += BLOCK_K * ldb
+                else:
+                    B += BLOCK_K
+        
+            # rematerialize rm and rn to save registers
+            rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            #C = C + (rm[None, :] + rn[:, None] * ldc)
+            mask = (rm < M)[None, :] & (rn < N)[:, None]
+            #c = tl.load(C, mask=mask)
+        
+            # compute alpha * AB + beta * C
+            acc = acc * alpha #+ beta * c
+        
+            acc = acc.to(D.dtype.element_ty)
+            D = D + (rm[None, :] + rn[:, None] * ldd)
+            tl.store(D, acc, mask=mask)
+            pid += num_pids
+        else:  # end of if pid > 0
+          pid -= b_size
 
 
 def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
@@ -183,10 +184,7 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
     c_ptrs = []
     ldcs = []
 
-    block_aligned = []
-    BLOCK_M = 32
-    BLOCK_N = 128 if a.dtype == torch.float16 else 64
-    BLOCK_K = 64
+    #block_aligned = []
 
     array_d = []
 
@@ -205,7 +203,7 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
         c_ptrs.append(c.data_ptr())
         ldcs.append(N)
 
-        block_aligned.append(triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N))
+        #block_aligned.append(triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N))
 
     # convert list into cuda tensors
     a_ptrs_tensor = torch.tensor(tuple(a_ptrs), dtype=torch.int64, device=device)
@@ -219,7 +217,7 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
     c_ptrs_tensor = torch.tensor(tuple(c_ptrs), dtype=torch.int64, device=device)
     ldcs_tensor = torch.tensor(tuple(ldcs), dtype=torch.int32, device=device)
 
-    block_aligned_tensor = torch.tensor(tuple(block_aligned), dtype=torch.int32, device=device)
+    #block_aligned_tensor = torch.tensor(tuple(block_aligned), dtype=torch.int32, device=device)
 
     # T(C=AB) ==> T(C) = T(B) * T(A), column-major
     # launch kernel
@@ -234,10 +232,12 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
         m = (m_sizes_tensor / BLOCK_M).ceil().to(torch.int32)
         n = (n_sizes_tensor / BLOCK_N).ceil().to(torch.int32)
         ret = sum(m * n)
+        #ret = sum(m)
+        #print('grid: ', ret)
         
         return (ret,)
     grid = lambda META: get_grid(**META)
-    grouped_gemm_kernel[grid](block_aligned_tensor, len(array_a),
+    grouped_gemm_kernel[grid](len(array_a),
                   n_sizes_tensor, m_sizes_tensor, K,
                   alpha_tensor,
                   b_ptrs_tensor, ldbs_tensor,
@@ -248,12 +248,12 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
                   DTYPE=tl.float32 if array_a[0].dtype == torch.float32 else tl.float16,
                   ACC_DTYPE=tl.float32,
                   TRANS_A=trans_b, TRANS_B=trans_a,  # 0 for N, 1 for T
-                  BLOCK_M=BLOCK_N,
-                  BLOCK_N=BLOCK_M,
-                  BLOCK_K=BLOCK_K,
-                  GROUP_M=8,
-                  #EVEN_K=int(K % BLOCK_K == 0),
+                  #BLOCK_M=64,
+                  #BLOCK_N=32,
+                  #BLOCK_K=64,
+                  #GROUP_M=8,
                   #num_warps=8,
+                  #EVEN_K=int(K % BLOCK_K == 0),
                   )
     return array_c
 
@@ -284,10 +284,28 @@ def triton_groupedgemm_wrap(list_a, list_b):
 
 def torch_grouped_gemm(list_a, list_b):
     list_c = []
+    if PYTORCH_GROUPED_GEMM is not None:
+        for a, b in zip(list_a, list_b):
+            M, K = a.shape[0], a.shape[1]
+            N = b.shape[1]
+            c = torch.zeros((M, N), device=a.device, dtype=a.dtype)
+            list_c.append(c)
+
+        PYTORCH_GROUPED_GEMM.GroupedGEMM(list_a, list_b, list_c, list_c, 1.0, 0.0)
+    else:
+        for a, b in zip(list_a, list_b):
+            c = torch.matmul(a, b)
+            list_c.append(c)
+    
+    return list_c
+
+def triton_matmul(list_a, list_b):
+    list_c = []
     for a, b in zip(list_a, list_b):
-        c = torch.matmul(a, b)
+        c = matmul(a, b)
         list_c.append(c)
     return list_c
+ 
 
 def test_speed(mnk_array, device, dtype):
     a_list = []
@@ -297,24 +315,13 @@ def test_speed(mnk_array, device, dtype):
     for (m, n, k) in mnk_array:
         a_list.append(torch.randn(m, k, device=device, dtype=dtype))
         b_list.append(torch.randn(k, n, device=device, dtype=dtype))
-        max_m = max(max_m, m)
-        max_n = max(max_n, n)
-        max_k = max(max_k, k)
 
-    batch = len(a_list)
-    aligned = 16
-    max_m = (max_m // aligned + 1) * aligned
-    max_n = (max_n // aligned + 1) * aligned
-    max_k = (max_k // aligned + 1) * aligned
+    #print('torch: ', triton.testing.do_bench(lambda: torch_grouped_gemm(a_list, b_list)))
+    #print('triton-matmul: ', triton.testing.do_bench(lambda: triton_matmul(a_list, b_list)))
+    print('triton-groupedgemm: ', triton.testing.do_bench(lambda: triton_groupedgemm_wrap(a_list, b_list)))
+    print('best: ', grouped_gemm_kernel.best_config)
 
-    # generate aligned input data for torch
-    A_torch = torch.randn(batch, max_m, max_k, device=device, dtype=dtype)
-    B_torch = torch.randn(batch, max_k, max_n, device=device, dtype=dtype)
-
-    print('torch: ', triton.testing.do_bench(lambda: torch.matmul(A_torch, B_torch)))
-    print('triton: ', triton.testing.do_bench(lambda: triton_groupedgemm_wrap(a_list, b_list)))
-
-def compare(mnk_array, device, dtype):
+def compare_result(mnk_array, device, dtype):
     a_list = []
     b_list = []
     # generate input data for triton
@@ -331,8 +338,8 @@ def compare(mnk_array, device, dtype):
         else:
             diff = abs(t1 - t2)
             print('dtype: ', dtype, ' shape: ', t1.shape, ' max diff: ', diff.max(), ' rel-diff: ', (diff / t2).max())
-            #print('triton: ', t1)
-            #print('torch: ', t2)
+            print('triton: ', t1)
+            print('torch: ', t2)
 
 def get_arges():
     parser = argparse.ArgumentParser(description="PyTorch Template Finetune Example")
@@ -346,12 +353,12 @@ def get_arges():
 
 if __name__ == '__main__':
     args = get_arges()
-    batch=16
-    M_start = 64
-    M_end = 4096
+    batch=2
+    M_start = 768
+    M_end = 768
     M = []
-    N = 2048
-    K = 1024
+    N = 192
+    K = 4608
     row1 = []
     for i in range(batch):
         m = random.randint(M_start, M_end)
@@ -365,15 +372,17 @@ if __name__ == '__main__':
     row9 = [[4608, 167, 384], [4608, 183, 384], [4608, 177, 384], [4608, 181, 384], [4608, 153, 384], [4608, 139, 384], [4608, 156, 384], [4608, 173, 384], [4608, 163, 384], [4608, 150, 384], [4608, 204, 384], [4608, 184, 384], [4608, 168, 384], [4608, 156, 384], [4608, 168, 384], [4608, 148, 384]]
 
     device = torch.device(0)
+    #device = torch.device(3)
     torch.cuda.manual_seed(42)
     dtype = torch.float32
     if args.fp16:
         dtype = torch.float16
 
-    for i, mnk in enumerate([row2, row3, row6, row7, row8, row9]):
+    #for i, mnk in enumerate([row2, row3, row6, row7, row8, row9]):
+    for i, mnk in enumerate([row8]):
         print('test row ', i)
         if args.compare:
-            compare(mnk, device, dtype)
+            compare_result(mnk, device, dtype)
         if args.speed:
             test_speed(mnk, device, dtype)
 
