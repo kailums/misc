@@ -8,6 +8,7 @@ import argparse
 from triton.ops import matmul
 
 import sys
+import os
 if os.path.exists("/ws/work/pytorch_grouped_gemm/build"):
     sys.path.append("/ws/work/pytorch_grouped_gemm/build")
     import PYTORCH_GROUPED_GEMM
@@ -20,9 +21,11 @@ else:
        #triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 16, 'GROUP_M': 2}, num_stages=3, num_warps=8),
        #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=32),
        #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=16),
-       triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
-       triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
-       triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+       #triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+       #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+       triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+       #triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+       #triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
     ],
     key=['K'],
 )
@@ -284,7 +287,7 @@ def triton_groupedgemm_wrap(list_a, list_b):
 
 def torch_grouped_gemm(list_a, list_b):
     list_c = []
-    if PYTORCH_GROUPED_GEMM is not None:
+    if PYTORCH_GROUPED_GEMM is not None and list_a[0].dtype != torch.float16:
         for a, b in zip(list_a, list_b):
             M, K = a.shape[0], a.shape[1]
             N = b.shape[1]
@@ -316,7 +319,7 @@ def test_speed(mnk_array, device, dtype):
         a_list.append(torch.randn(m, k, device=device, dtype=dtype))
         b_list.append(torch.randn(k, n, device=device, dtype=dtype))
 
-    #print('torch: ', triton.testing.do_bench(lambda: torch_grouped_gemm(a_list, b_list)))
+    print('torch: ', triton.testing.do_bench(lambda: torch_grouped_gemm(a_list, b_list)))
     #print('triton-matmul: ', triton.testing.do_bench(lambda: triton_matmul(a_list, b_list)))
     print('triton-groupedgemm: ', triton.testing.do_bench(lambda: triton_groupedgemm_wrap(a_list, b_list)))
     print('best: ', grouped_gemm_kernel.best_config)
