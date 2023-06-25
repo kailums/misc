@@ -6,6 +6,7 @@ import triton.language as tl
 import random
 import argparse
 from triton.ops import matmul
+from itertools import product
 
 import sys
 import os
@@ -15,17 +16,23 @@ if os.path.exists("/ws/work/pytorch_grouped_gemm/build"):
 else:
     PYTORCH_GROUPED_GEMM = None
 
+def gen_tune_config():
+    m_range = [16, 32, 64]
+    n_range = [16, 32, 64]
+    k_range = [32, 64, 128]
+    stages = [1,2,3]
+    warps = [4, 8, 16, 32]
+    configs = []
+    for m,n,k,s,w in product(m_range, n_range, k_range, stages, warps):
+        configs.append(triton.Config({'BLOCK_M':m, 'BLOCK_N':n, 'BLOCK_K':k, 'GROUP_M':8}, num_stages=s, num_warps=w))
+
+    return configs
+
 
 @triton.autotune(
+    #configs=gen_tune_config(),
     configs=[
-       #triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 16, 'GROUP_M': 2}, num_stages=3, num_warps=8),
-       #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=32),
-       #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=16),
-       #triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
-       #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
-       triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
-       #triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
-       #triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
     ],
     key=['K'],
 )
@@ -44,6 +51,7 @@ def grouped_gemm_kernel(num_of_matrix,
         DTYPE: tl.constexpr,
         ACC_DTYPE: tl.constexpr,
         TRANS_A: tl.constexpr, TRANS_B: tl.constexpr,
+        BETA_ZERO: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr, EVEN_K: tl.constexpr,
     ):
@@ -135,12 +143,15 @@ def grouped_gemm_kernel(num_of_matrix,
             # rematerialize rm and rn to save registers
             rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
             rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-            #C = C + (rm[None, :] + rn[:, None] * ldc)
             mask = (rm < M)[None, :] & (rn < N)[:, None]
-            #c = tl.load(C, mask=mask)
+            if BETA_ZERO:
+                acc = acc * alpha
+            else:
+                C = C + (rm[None, :] + rn[:, None] * ldc)
+                c = tl.load(C, mask=mask)
         
-            # compute alpha * AB + beta * C
-            acc = acc * alpha #+ beta * c
+                # compute alpha * AB + beta * C
+                acc = acc * alpha + beta * c
         
             acc = acc.to(D.dtype.element_ty)
             D = D + (rm[None, :] + rn[:, None] * ldd)
@@ -251,6 +262,7 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
                   DTYPE=tl.float32 if array_a[0].dtype == torch.float32 else tl.float16,
                   ACC_DTYPE=tl.float32,
                   TRANS_A=trans_b, TRANS_B=trans_a,  # 0 for N, 1 for T
+                  BETA_ZERO=1,  # beta is zero
                   #BLOCK_M=64,
                   #BLOCK_N=32,
                   #BLOCK_K=64,
@@ -287,7 +299,8 @@ def triton_groupedgemm_wrap(list_a, list_b):
 
 def torch_grouped_gemm(list_a, list_b):
     list_c = []
-    if PYTORCH_GROUPED_GEMM is not None and list_a[0].dtype != torch.float16:
+    #if PYTORCH_GROUPED_GEMM is not None and list_a[0].dtype != torch.float16:
+    if PYTORCH_GROUPED_GEMM is not None:
         for a, b in zip(list_a, list_b):
             M, K = a.shape[0], a.shape[1]
             N = b.shape[1]
@@ -322,7 +335,6 @@ def test_speed(mnk_array, device, dtype):
     print('torch: ', triton.testing.do_bench(lambda: torch_grouped_gemm(a_list, b_list)))
     #print('triton-matmul: ', triton.testing.do_bench(lambda: triton_matmul(a_list, b_list)))
     print('triton-groupedgemm: ', triton.testing.do_bench(lambda: triton_groupedgemm_wrap(a_list, b_list)))
-    print('best: ', grouped_gemm_kernel.best_config)
 
 def compare_result(mnk_array, device, dtype):
     a_list = []
@@ -341,8 +353,8 @@ def compare_result(mnk_array, device, dtype):
         else:
             diff = abs(t1 - t2)
             print('dtype: ', dtype, ' shape: ', t1.shape, ' max diff: ', diff.max(), ' rel-diff: ', (diff / t2).max())
-            print('triton: ', t1)
-            print('torch: ', t2)
+            #print('triton: ', t1)
+            #print('torch: ', t2)
 
 def get_arges():
     parser = argparse.ArgumentParser(description="PyTorch Template Finetune Example")
@@ -356,16 +368,17 @@ def get_arges():
 
 if __name__ == '__main__':
     args = get_arges()
-    batch=2
-    M_start = 768
-    M_end = 768
-    M = []
-    N = 192
+    batch=16
+    N_start = 100
+    N_end = 200
+    N = []
+    M = 768
     K = 4608
     row1 = []
+    random.seed(42)
     for i in range(batch):
-        m = random.randint(M_start, M_end)
-        row1.append([m, N, K])
+        n = random.randint(N_start, N_end) // 8 * 8  # align to 8
+        row1.append([M, n, K])
 
     row2 = [[768,1,4608], [768,1,4608]]
     row3 = [[4608,1,384], [4608,1,384]]
@@ -382,10 +395,11 @@ if __name__ == '__main__':
         dtype = torch.float16
 
     #for i, mnk in enumerate([row2, row3, row6, row7, row8, row9]):
-    for i, mnk in enumerate([row8]):
-        print('test row ', i)
+    for i, mnk in enumerate([row1]):
+        print('test row ', mnk)
         if args.compare:
             compare_result(mnk, device, dtype)
         if args.speed:
             test_speed(mnk, device, dtype)
 
+    print('best: ', grouped_gemm_kernel.best_config)
