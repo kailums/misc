@@ -29,18 +29,18 @@ def gen_tune_config():
     return configs
 
 
-@triton.autotune(
-    #configs=gen_tune_config(),
-    configs=[
-       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
-    ],
-    key=['K'],
-)
+#@triton.autotune(
+#    #configs=gen_tune_config(),
+#    configs=[
+#       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+#    ],
+#    key=['K'],
+#)
 @triton.heuristics({
     'EVEN_K': lambda args: args['K'] % args['BLOCK_K'] == 0,
 })
 @triton.jit
-def grouped_gemm_kernel(num_of_matrix,
+def grouped_gemm_kernel(block_mids, block_offset, num_of_mids,
         m_array, n_array, K,
         array_alpha,
         a_ptrs, ldas,
@@ -64,101 +64,98 @@ def grouped_gemm_kernel(num_of_matrix,
     else:
         DTYPE = tl.float32
 
-    # search for A pointer, M, C pointer of current pid
-    for i in range(0, num_of_matrix):
+    while pid < num_of_mids:
+        i = tl.load(block_mids + pid)
+        work_offset = tl.load(block_offset + pid)
+
+        # search for A pointer, M, C pointer of current pid
         M = tl.load(m_array + i)
         N = tl.load(n_array + i)
         grid_m = tl.cdiv(M, BLOCK_M)
         grid_n = tl.cdiv(N, BLOCK_N)
 
-        b_size = grid_m * grid_n
+        A = tl.load(a_ptrs + i).to(tl.pointer_type(DTYPE))
+        lda = tl.load(ldas + i)
+        B = tl.load(b_ptrs + i).to(tl.pointer_type(DTYPE))
+        ldb = tl.load(ldbs + i)
+        C = tl.load(c_ptrs + i).to(tl.pointer_type(DTYPE))
+        ldc = tl.load(ldcs + i)
+        D = tl.load(d_ptrs + i).to(tl.pointer_type(DTYPE))
+        ldd = tl.load(ldds + i)
+        alpha = tl.load(array_alpha + i)
+        beta = tl.load(array_beta + i)
 
-        if pid >= 0 and pid < b_size:
-            # found
-            A = tl.load(a_ptrs + i).to(tl.pointer_type(DTYPE))
-            lda = tl.load(ldas + i)
-            B = tl.load(b_ptrs + i).to(tl.pointer_type(DTYPE))
-            ldb = tl.load(ldbs + i)
-            C = tl.load(c_ptrs + i).to(tl.pointer_type(DTYPE))
-            ldc = tl.load(ldcs + i)
-            D = tl.load(d_ptrs + i).to(tl.pointer_type(DTYPE))
-            ldd = tl.load(ldds + i)
-            alpha = tl.load(array_alpha + i)
-            beta = tl.load(array_beta + i)
-
-            # matrix multiplication
-            # re-order program ID for better L2 performance
-            width = GROUP_M * grid_m
-            group_id = pid // width
-            group_size = min(grid_n - group_id * GROUP_M, GROUP_M)
-            pid_n = group_id * GROUP_M + (pid % group_size)
-            pid_m = (pid % width) // (group_size)
-            # do matrix multiplication
-            rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-            ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-            rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-            rk = tl.arange(0, BLOCK_K)
-            # pointers
-            if TRANS_A == 1:
-                A = A + (ram[None, :] * lda + rk[:, None])  # KxM
+        # matrix multiplication
+        # re-order program ID for better L2 performance
+        width = GROUP_M * grid_m
+        group_id = work_offset // width
+        group_size = min(grid_n - group_id * GROUP_M, GROUP_M)
+        pid_n = group_id * GROUP_M + (work_offset % group_size)
+        pid_m = (work_offset % width) // (group_size)
+        # do matrix multiplication
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+        rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+        rk = tl.arange(0, BLOCK_K)
+        # pointers
+        if TRANS_A == 1:
+            A = A + (ram[None, :] * lda + rk[:, None])  # KxM
+        else:
+            A = A + (ram[None, :] + rk[:, None] * lda)  # KxM
+        
+        if TRANS_B == 1:
+            B = B + (rk[None, :] * ldb + rbn[:, None])  # NxK
+        else:
+            B = B + (rk[None, :] + rbn[:, None] * ldb)  # NxK
+        
+        acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=ACC_DTYPE)
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            if EVEN_K:
+                a = tl.load(A)
+                b = tl.load(B)
             else:
-                A = A + (ram[None, :] + rk[:, None] * lda)  # KxM
-        
-            if TRANS_B == 1:
-                B = B + (rk[None, :] * ldb + rbn[:, None])  # NxK
-            else:
-                B = B + (rk[None, :] + rbn[:, None] * ldb)  # NxK
-        
-            acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=ACC_DTYPE)
-            for k in range(0, tl.cdiv(K, BLOCK_K)):
-                if EVEN_K:
-                    a = tl.load(A)
-                    b = tl.load(B)
-                else:
-                    k_remaining = K - k * BLOCK_K
-                    if TRANS_A == 1:
-                        a = tl.load(A, mask=rk[:, None] < k_remaining, other=0.)
-                    else:
-                        a = tl.load(A, mask=rk[:, None] < k_remaining, other=0.)
-        
-                    if TRANS_B == 1:
-                        b = tl.load(B, mask=rk[None, :] < k_remaining, other=0.)
-                    else:
-                        b = tl.load(B, mask=rk[None, :] < k_remaining, other=0.)
-        
-                # do compute
-                acc += tl.dot(b, a)
-        
+                k_remaining = K - k * BLOCK_K
                 if TRANS_A == 1:
-                    A += BLOCK_K
+                    a = tl.load(A, mask=rk[:, None] < k_remaining, other=0.)
                 else:
-                    A += BLOCK_K * lda
+                    a = tl.load(A, mask=rk[:, None] < k_remaining, other=0.)
         
                 if TRANS_B == 1:
-                    B += BLOCK_K * ldb
+                    b = tl.load(B, mask=rk[None, :] < k_remaining, other=0.)
                 else:
-                    B += BLOCK_K
+                    b = tl.load(B, mask=rk[None, :] < k_remaining, other=0.)
         
-            # rematerialize rm and rn to save registers
-            rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-            mask = (rm < M)[None, :] & (rn < N)[:, None]
-            if BETA_ZERO:
-                acc = acc * alpha
+            # do compute
+            acc += tl.dot(b, a)
+        
+            if TRANS_A == 1:
+                A += BLOCK_K
             else:
-                C = C + (rm[None, :] + rn[:, None] * ldc)
-                c = tl.load(C, mask=mask)
+                A += BLOCK_K * lda
         
-                # compute alpha * AB + beta * C
-                acc = acc * alpha + beta * c
+            if TRANS_B == 1:
+                B += BLOCK_K * ldb
+            else:
+                B += BLOCK_K
         
-            acc = acc.to(D.dtype.element_ty)
-            D = D + (rm[None, :] + rn[:, None] * ldd)
-            tl.store(D, acc, mask=mask)
-            pid += num_pids
-        else:  # end of if pid > 0
-          pid -= b_size
+        # rematerialize rm and rn to save registers
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (rm < M)[None, :] & (rn < N)[:, None]
+        if BETA_ZERO:
+            acc = acc * alpha
+        else:
+            C = C + (rm[None, :] + rn[:, None] * ldc)
+            c = tl.load(C, mask=mask)
+        
+            # compute alpha * AB + beta * C
+            acc = acc * alpha + beta * c
+        
+        acc = acc.to(D.dtype.element_ty)
+        D = D + (rm[None, :] + rn[:, None] * ldd)
+        tl.store(D, acc, mask=mask)
+        pid += num_pids
 
 
 def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
@@ -197,15 +194,18 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
     ldbs = []
     c_ptrs = []
     ldcs = []
+    BLOCK_M=128
+    BLOCK_N=64
 
-    #block_aligned = []
+    block_offset = []
+    block_mids = []
 
     array_d = []
 
     trans_a = 0
     trans_b = 0
 
-    for a,b,c in zip(array_a, array_b, array_c):
+    for i, (a,b,c) in enumerate(zip(array_a, array_b, array_c)):
         M = a.shape[0]
         a_ptrs.append(a.data_ptr())
         m_sizes.append(M)
@@ -217,7 +217,9 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
         c_ptrs.append(c.data_ptr())
         ldcs.append(N)
 
-        #block_aligned.append(triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N))
+        mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+        block_mids.extend([i for _ in range(mn)])
+        block_offset.extend([off for off in range(mn)])
 
     # convert list into cuda tensors
     a_ptrs_tensor = torch.tensor(tuple(a_ptrs), dtype=torch.int64, device=device)
@@ -231,7 +233,8 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
     c_ptrs_tensor = torch.tensor(tuple(c_ptrs), dtype=torch.int64, device=device)
     ldcs_tensor = torch.tensor(tuple(ldcs), dtype=torch.int32, device=device)
 
-    #block_aligned_tensor = torch.tensor(tuple(block_aligned), dtype=torch.int32, device=device)
+    block_offset_tensor = torch.tensor(tuple(block_offset), dtype=torch.int32, device=device)
+    block_mids_tensor = torch.tensor(tuple(block_mids), dtype=torch.int32, device=device)
 
     # T(C=AB) ==> T(C) = T(B) * T(A), column-major
     # launch kernel
@@ -240,7 +243,6 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
         n_sizes_tensor = kwargs['n_array']
         BLOCK_M = kwargs['BLOCK_M']
         BLOCK_N = kwargs['BLOCK_N']
-        num = kwargs['num_of_matrix']
 
         ret = 0
         m = (m_sizes_tensor / BLOCK_M).ceil().to(torch.int32)
@@ -251,7 +253,7 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
         
         return (ret,)
     grid = lambda META: get_grid(**META)
-    grouped_gemm_kernel[grid](len(array_a),
+    grouped_gemm_kernel[grid](block_mids_tensor, block_offset_tensor, len(block_mids),
                   n_sizes_tensor, m_sizes_tensor, K,
                   alpha_tensor,
                   b_ptrs_tensor, ldbs_tensor,
@@ -263,11 +265,11 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
                   ACC_DTYPE=tl.float32,
                   TRANS_A=trans_b, TRANS_B=trans_a,  # 0 for N, 1 for T
                   BETA_ZERO=1,  # beta is zero
-                  #BLOCK_M=64,
-                  #BLOCK_N=32,
-                  #BLOCK_K=64,
-                  #GROUP_M=8,
-                  #num_warps=8,
+                  BLOCK_M=BLOCK_N,
+                  BLOCK_N=BLOCK_M,
+                  BLOCK_K=128,
+                  GROUP_M=8,
+                  num_warps=8,
                   #EVEN_K=int(K % BLOCK_K == 0),
                   )
     return array_c
@@ -402,4 +404,4 @@ if __name__ == '__main__':
         if args.speed:
             test_speed(mnk, device, dtype)
 
-    print('best: ', grouped_gemm_kernel.best_config)
+    #print('best: ', grouped_gemm_kernel.best_config)
