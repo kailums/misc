@@ -17,14 +17,15 @@ else:
     PYTORCH_GROUPED_GEMM = None
 
 def gen_tune_config():
-    m_range = [16, 32, 64]
-    n_range = [16, 32, 64]
+    m_range = [16, 32, 64, 128]
+    n_range = [16, 32, 64, 128]
     k_range = [32, 64, 128]
-    stages = [1,2,3]
+    stages = [1,2,3,4,5,6]
     warps = [4, 8, 16, 32]
+    g_range = [2,4,8,16]
     configs = []
-    for m,n,k,s,w in product(m_range, n_range, k_range, stages, warps):
-        configs.append(triton.Config({'BLOCK_M':m, 'BLOCK_N':n, 'BLOCK_K':k, 'GROUP_M':8}, num_stages=s, num_warps=w))
+    for m,n,k,g,s,w in product(m_range, n_range, k_range, g_range, stages, warps):
+        configs.append(triton.Config({'BLOCK_M':m, 'BLOCK_N':n, 'BLOCK_K':k, 'GROUP_M':g}, num_stages=s, num_warps=w))
 
     return configs
 
@@ -32,7 +33,7 @@ def gen_tune_config():
 @triton.autotune(
     #configs=gen_tune_config(),
     configs=[
-       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_stages=3, num_warps=8),
     ],
     key=['K'],
 )
@@ -40,18 +41,15 @@ def gen_tune_config():
     'EVEN_K': lambda args: args['K'] % args['BLOCK_K'] == 0,
 })
 @triton.jit
-def grouped_gemm_kernel(num_of_matrix,
+def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
+        param_array,
         m_array, n_array, K,
-        array_alpha,
-        a_ptrs, ldas,
-        b_ptrs, ldbs,
-        array_beta,
-        c_ptrs, ldcs,
-        d_ptrs, ldds,
+        alpha, beta,
         DTYPE: tl.constexpr,
         ACC_DTYPE: tl.constexpr,
         TRANS_A: tl.constexpr, TRANS_B: tl.constexpr,
         BETA_ZERO: tl.constexpr,
+        PARAM_SIZE: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr, EVEN_K: tl.constexpr,
     ):
@@ -66,8 +64,9 @@ def grouped_gemm_kernel(num_of_matrix,
 
     # search for A pointer, M, C pointer of current pid
     for i in range(0, num_of_matrix):
-        M = tl.load(m_array + i)
-        N = tl.load(n_array + i)
+        param_ptr = param_array + i * PARAM_SIZE,
+        M = tl.load(param_ptr).to(tl.int32)
+        N = tl.load(param_ptr + 1).to(tl.int32)
         grid_m = tl.cdiv(M, BLOCK_M)
         grid_n = tl.cdiv(N, BLOCK_N)
 
@@ -75,16 +74,10 @@ def grouped_gemm_kernel(num_of_matrix,
 
         if pid >= 0 and pid < b_size:
             # found
-            A = tl.load(a_ptrs + i).to(tl.pointer_type(DTYPE))
-            lda = tl.load(ldas + i)
-            B = tl.load(b_ptrs + i).to(tl.pointer_type(DTYPE))
-            ldb = tl.load(ldbs + i)
-            C = tl.load(c_ptrs + i).to(tl.pointer_type(DTYPE))
-            ldc = tl.load(ldcs + i)
-            D = tl.load(d_ptrs + i).to(tl.pointer_type(DTYPE))
-            ldd = tl.load(ldds + i)
-            alpha = tl.load(array_alpha + i)
-            beta = tl.load(array_beta + i)
+            A = tl.load(param_ptr + 2).to(tl.pointer_type(DTYPE))
+            lda = tl.load(param_ptr + 3).to(tl.int32)
+            B = tl.load(param_ptr + 4).to(tl.pointer_type(DTYPE))
+            ldb = tl.load(param_ptr + 5).to(tl.int32)
 
             # matrix multiplication
             # re-order program ID for better L2 performance
@@ -141,6 +134,11 @@ def grouped_gemm_kernel(num_of_matrix,
                     B += BLOCK_K
         
             # rematerialize rm and rn to save registers
+            C = tl.load(param_ptr + 6).to(tl.pointer_type(DTYPE))
+            ldc = tl.load(param_ptr + 7).to(tl.int32)
+            D = tl.load(param_ptr + 8).to(tl.pointer_type(DTYPE))
+            ldd = tl.load(param_ptr + 9).to(tl.int32)
+
             rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
             rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
             mask = (rm < M)[None, :] & (rn < N)[:, None]
@@ -161,7 +159,7 @@ def grouped_gemm_kernel(num_of_matrix,
           pid -= b_size
 
 
-def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
+def triton_grouped_gemm(array_a, array_b, array_c, array_d, alpha, beta):
     """
     grouped gemm's signature is (trans_a, trans_b
                              vector<> m, vector<> n, vector<> k
@@ -189,49 +187,28 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
     K = a.shape[1]
 
     # allocates output
-    a_ptrs = []
     m_sizes = []
     n_sizes = []
-    ldas = []
-    b_ptrs = []
-    ldbs = []
-    c_ptrs = []
-    ldcs = []
-
-    #block_aligned = []
-
-    array_d = []
 
     trans_a = 0
     trans_b = 0
 
-    for a,b,c in zip(array_a, array_b, array_c):
+    params = []
+
+    for a,b,c,d in zip(array_a, array_b, array_c, array_d):
         M = a.shape[0]
-        a_ptrs.append(a.data_ptr())
         m_sizes.append(M)
-        ldas.append(K)
         N = b.shape[1]
         n_sizes.append(N)
-        b_ptrs.append(b.data_ptr())
-        ldbs.append(N)
-        c_ptrs.append(c.data_ptr())
-        ldcs.append(N)
 
-        #block_aligned.append(triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N))
+        # need to padding to 16
+        params.extend([N, M, b.data_ptr(), N, a.data_ptr(), K, c.data_ptr(), N, d.data_ptr(), N, N, N, N, N, N, N])
+
 
     # convert list into cuda tensors
-    a_ptrs_tensor = torch.tensor(tuple(a_ptrs), dtype=torch.int64, device=device)
     m_sizes_tensor = torch.tensor(tuple(m_sizes), dtype=torch.int32, device=device)
     n_sizes_tensor = torch.tensor(tuple(n_sizes), dtype=torch.int32, device=device)
-    alpha_tensor = torch.tensor(tuple(array_alpha), dtype=torch.float32, device=device)
-    beta_tensor = torch.tensor(tuple(array_beta), dtype=torch.float32, device=device)
-    ldas_tensor = torch.tensor(tuple(ldas), dtype=torch.int32, device=device)
-    b_ptrs_tensor = torch.tensor(tuple(b_ptrs), dtype=torch.int64, device=device)
-    ldbs_tensor = torch.tensor(tuple(ldbs), dtype=torch.int32, device=device)
-    c_ptrs_tensor = torch.tensor(tuple(c_ptrs), dtype=torch.int64, device=device)
-    ldcs_tensor = torch.tensor(tuple(ldcs), dtype=torch.int32, device=device)
-
-    #block_aligned_tensor = torch.tensor(tuple(block_aligned), dtype=torch.int32, device=device)
+    params_tensor = torch.tensor(tuple(params), dtype=torch.int64, device=device)
 
     # T(C=AB) ==> T(C) = T(B) * T(A), column-major
     # launch kernel
@@ -252,17 +229,14 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
         return (ret,)
     grid = lambda META: get_grid(**META)
     grouped_gemm_kernel[grid](len(array_a),
+                  params_tensor,
                   n_sizes_tensor, m_sizes_tensor, K,
-                  alpha_tensor,
-                  b_ptrs_tensor, ldbs_tensor,
-                  a_ptrs_tensor, ldas_tensor,
-                  beta_tensor,
-                  c_ptrs_tensor, ldcs_tensor,
-                  c_ptrs_tensor, ldcs_tensor,  # re-use c_ptr as output d ptr.
+                  alpha, beta,
                   DTYPE=tl.float32 if array_a[0].dtype == torch.float32 else tl.float16,
                   ACC_DTYPE=tl.float32,
                   TRANS_A=trans_b, TRANS_B=trans_a,  # 0 for N, 1 for T
-                  BETA_ZERO=1,  # beta is zero
+                  BETA_ZERO=(beta == 0.0),  # beta is zero
+                  PARAM_SIZE=16,
                   #BLOCK_M=64,
                   #BLOCK_N=32,
                   #BLOCK_K=64,
@@ -277,25 +251,17 @@ def triton_groupedgemm_wrap(list_a, list_b):
     list_a is a list of tensor a, with shape MxK, where M may be different.
     b is a tensor, with shape KxN.
     """
-    array_alpha = []
-    array_a = []
-    array_b = []
-    array_beta = []
-    array_c = []
+    list_c = []
     for a,b in zip(list_a, list_b):
-      array_alpha.append(1.0)
-      array_a.append(a)
-      array_b.append(b)
-      array_beta.append(0.0)
       M,K = a.shape[0], a.shape[1]
       K1,N = b.shape[0], b.shape[1]
       assert K == K1
       c = torch.zeros((M, N), device=a.device, dtype=a.dtype)
-      array_c.append(c)
+      list_c.append(c)
 
-    triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c)
+    triton_grouped_gemm(list_a, list_b, list_c, list_c, 1.0, 0.0)
 
-    return array_c
+    return list_c
 
 def torch_grouped_gemm(list_a, list_b):
     list_c = []

@@ -10,21 +10,21 @@ from itertools import product
 
 import sys
 import os
+PYTORCH_GROUPED_GEMM = None
 if os.path.exists("/ws/work/pytorch_grouped_gemm/build"):
     sys.path.append("/ws/work/pytorch_grouped_gemm/build")
     import PYTORCH_GROUPED_GEMM
-else:
-    PYTORCH_GROUPED_GEMM = None
 
 def gen_tune_config():
     #m_range = [16, 32, 64]
     #n_range = [16, 32, 64]
-    k_range = [32, 64, 128]
+    k_range = [16, 32, 64, 128]
     stages = [1,2,3,4,5,6]
     warps = [4, 8, 16, 32]
+    g_range = [2,4,8,16]
     configs = []
-    for k,s,w in product(k_range, stages, warps):
-        configs.append(triton.Config({'BLOCK_K':k, 'GROUP_M':8}, num_stages=s, num_warps=w))
+    for k,g,s,w in product(k_range, g_range, stages, warps):
+        configs.append(triton.Config({'BLOCK_K':k, 'GROUP_M':g}, num_stages=s, num_warps=w))
 
     return configs
 
@@ -32,7 +32,7 @@ def gen_tune_config():
 @triton.autotune(
     #configs=gen_tune_config(),
     configs=[
-       triton.Config({'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=6, num_warps=4),
+       triton.Config({'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=1, num_warps=4),
     ],
     key=['K'],
 )
@@ -69,7 +69,12 @@ def grouped_gemm_kernel(block_mids, block_offset, num_of_mids,
     param_ptr = param_array + i * PARAM_SIZE
     M = tl.load(param_ptr).to(tl.int32)
     N = tl.load(param_ptr + 1).to(tl.int32)
-    
+
+    # pointers
+    A = tl.load(param_ptr + 2).to(tl.pointer_type(DTYPE))
+    lda = tl.load(param_ptr + 3).to(tl.int32)
+    B = tl.load(param_ptr + 4).to(tl.pointer_type(DTYPE))
+    ldb = tl.load(param_ptr + 5).to(tl.int32)   
     grid_m = tl.cdiv(M, BLOCK_M)
     grid_n = tl.cdiv(N, BLOCK_N)
 
@@ -86,12 +91,6 @@ def grouped_gemm_kernel(block_mids, block_offset, num_of_mids,
     ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
     rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
-
-    # pointers
-    A = tl.load(param_ptr + 2).to(tl.pointer_type(DTYPE))
-    lda = tl.load(param_ptr + 3).to(tl.int32)
-    B = tl.load(param_ptr + 4).to(tl.pointer_type(DTYPE))
-    ldb = tl.load(param_ptr + 5).to(tl.int32)
 
     if TRANS_A == 1:
         A = A + (ram[None, :] * lda + rk[:, None])  # KxM
@@ -156,7 +155,7 @@ def grouped_gemm_kernel(block_mids, block_offset, num_of_mids,
     tl.store(D, acc, mask=mask)
 
 
-def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
+def triton_grouped_gemm(array_a, array_b, array_c, array_d, alpha, beta):
     """
     grouped gemm's signature is (trans_a, trans_b
                              vector<> m, vector<> n, vector<> k
@@ -195,10 +194,11 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
     params = []
     grid_size = 0
 
-    for i, (a,b,c) in enumerate(zip(array_a, array_b, array_c)):
+    for i, (a,b,c,d) in enumerate(zip(array_a, array_b, array_c, array_d)):
         M = a.shape[0]
         N = b.shape[1]
-        params.extend([N, M, b.data_ptr(), N, a.data_ptr(), K, c.data_ptr(), N, c.data_ptr(), N, N, N, N, N, N, N])
+        # need to padding to 16
+        params.extend([N, M, b.data_ptr(), N, a.data_ptr(), K, c.data_ptr(), N, d.data_ptr(), N, N, N, N, N, N, N])
 
         mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
         grid_size += mn
@@ -215,13 +215,13 @@ def triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c):
     grouped_gemm_kernel[(grid_size,)](block_mids_tensor, block_offset_tensor, len(block_mids),
                   params_tensor,
                   K,
-                  alpha=1.0,
-                  beta=0.0,
+                  alpha=alpha,
+                  beta=beta,
                   DTYPE=tl.float32 if array_a[0].dtype == torch.float32 else tl.float16,
                   ACC_DTYPE=tl.float32,
                   TRANS_A=trans_b, TRANS_B=trans_a,  # 0 for N, 1 for T
                   PARAM_SIZE=16,
-                  BETA_ZERO=1,  # beta is zero
+                  BETA_ZERO=(beta == 0.0),  # beta is zero
                   BLOCK_M=BLOCK_N,
                   BLOCK_N=BLOCK_M,
                   #BLOCK_K=128,
@@ -236,25 +236,17 @@ def triton_groupedgemm_wrap(list_a, list_b):
     list_a is a list of tensor a, with shape MxK, where M may be different.
     b is a tensor, with shape KxN.
     """
-    array_alpha = []
-    array_a = []
-    array_b = []
-    array_beta = []
-    array_c = []
+    list_c = []
     for a,b in zip(list_a, list_b):
-      array_alpha.append(1.0)
-      array_a.append(a)
-      array_b.append(b)
-      array_beta.append(0.0)
       M,K = a.shape[0], a.shape[1]
       K1,N = b.shape[0], b.shape[1]
       assert K == K1
       c = torch.zeros((M, N), device=a.device, dtype=a.dtype)
-      array_c.append(c)
+      list_c.append(c)
 
-    triton_grouped_gemm(array_alpha, array_a, array_b, array_beta, array_c)
+    triton_grouped_gemm(list_a, list_b, list_c, list_c, 1.0, 0.0)
 
-    return array_c
+    return list_c
 
 def torch_grouped_gemm(list_a, list_b):
     list_c = []
@@ -291,9 +283,8 @@ def test_speed(mnk_array, device, dtype):
         a_list.append(torch.randn(m, k, device=device, dtype=dtype))
         b_list.append(torch.randn(k, n, device=device, dtype=dtype))
 
-    print('torch: ', triton.testing.do_bench(lambda: torch_grouped_gemm(a_list, b_list)))
-    #print('triton-matmul: ', triton.testing.do_bench(lambda: triton_matmul(a_list, b_list)))
     print('triton-groupedgemm: ', triton.testing.do_bench(lambda: triton_groupedgemm_wrap(a_list, b_list)))
+    print('torch: ', triton.testing.do_bench(lambda: torch_grouped_gemm(a_list, b_list)))
 
 def compare_result(mnk_array, device, dtype):
     a_list = []
