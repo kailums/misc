@@ -16,16 +16,20 @@ if os.path.exists("/ws/work/pytorch_grouped_gemm/build"):
 else:
     PYTORCH_GROUPED_GEMM = None
 
+def debug_config(kwargs):
+    pass
+    #print(kwargs)
+
 def gen_tune_config():
-    m_range = [16, 32, 64, 128]
-    n_range = [16, 32, 64, 128]
+    m_range = [32,64, 128]
+    n_range = [32,64, 128]
     k_range = [32, 64, 128]
     stages = [1,2,3,4,5,6]
-    warps = [4, 8, 16, 32]
-    g_range = [2,4,8,16]
+    warps = [4, 8,16]
+    g_range = [2,4,8]
     configs = []
     for m,n,k,g,s,w in product(m_range, n_range, k_range, g_range, stages, warps):
-        configs.append(triton.Config({'BLOCK_M':m, 'BLOCK_N':n, 'BLOCK_K':k, 'GROUP_M':g}, num_stages=s, num_warps=w))
+        configs.append(triton.Config({'BLOCK_M':m, 'BLOCK_N':n, 'BLOCK_K':k, 'GROUP_M':g}, num_stages=s, num_warps=w, pre_hook=debug_config))
 
     return configs
 
@@ -33,7 +37,10 @@ def gen_tune_config():
 @triton.autotune(
     #configs=gen_tune_config(),
     configs=[
-       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_stages=3, num_warps=8),
+       # best for row1 fp32
+       #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 2}, num_stages=2, num_warps=8),
+       # best for row1 fp16
+       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_stages=2, num_warps=8),
     ],
     key=['K'],
 )

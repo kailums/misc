@@ -32,7 +32,10 @@ def gen_tune_config():
 @triton.autotune(
     #configs=gen_tune_config(),
     configs=[
-       triton.Config({'BLOCK_K': 32, 'GROUP_M': 4}, num_stages=1, num_warps=4),
+       # best for fp32
+       #triton.Config({'BLOCK_K': 128, 'GROUP_M': 2}, num_stages=1, num_warps=16),
+       # best for fp16
+       triton.Config({'BLOCK_K': 32, 'GROUP_M': 2}, num_stages=1, num_warps=4),
     ],
     key=['K'],
 )
