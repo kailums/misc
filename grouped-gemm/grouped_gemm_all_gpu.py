@@ -10,11 +10,10 @@ from itertools import product
 
 import sys
 import os
+PYTORCH_GROUPED_GEMM = None
 if os.path.exists("/ws/work/pytorch_grouped_gemm/build"):
     sys.path.append("/ws/work/pytorch_grouped_gemm/build")
     import PYTORCH_GROUPED_GEMM
-else:
-    PYTORCH_GROUPED_GEMM = None
 
 def gen_tune_config():
     m_range = [16, 32, 64, 128]
@@ -33,7 +32,7 @@ def gen_tune_config():
 @triton.autotune(
     #configs=gen_tune_config(),
     configs=[
-       triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_M': 4}, num_stages=3, num_warps=8),
+       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=1, num_warps=4),
     ],
     key=['K'],
 )
@@ -45,12 +44,12 @@ def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
         m_array, N, K,
         alpha,
         A,
-        lda,
+        lda,   # sum of m
         B,
         ldb,
         beta,
         C,
-        ldc,
+        ldc,   # sum of m
         DTYPE: tl.constexpr,
         ACC_DTYPE: tl.constexpr,
         TRANS_A: tl.constexpr, TRANS_B: tl.constexpr,
@@ -79,8 +78,8 @@ def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
 
         while pid >= prefix_sum and pid < prefix_next:
             # found
-            A_ptr = A + offset_M * lda
-            B_ptr = B + i * K * ldb   # assume B is column-major
+            A_ptr = A + offset_M
+            B_ptr = B + i * N * ldb
 
             # matrix multiplication
             # re-order program ID for better L2 performance
@@ -102,7 +101,7 @@ def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
 
             # pointers
             if TRANS_A == 1:
-                A_ptr = A_ptr + (ram[None, :] * lda + rk[:, None])  # KxM
+                A_ptr = A_ptr + (ram[None, :] * K + rk[:, None])  # KxM
             else:
                 A_ptr = A_ptr + (ram[None, :] + rk[:, None] * lda)  # KxM
         
@@ -142,7 +141,7 @@ def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
                     B_ptr += BLOCK_K
         
             # rematerialize rm and rn to save registers
-            C_ptr = C + offset_M * ldc
+            C_ptr = C + offset_M
 
             rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
             rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -162,7 +161,7 @@ def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
         offset_M += M
         prefix_sum = prefix_next
 
-def triton_grouped_gemm(array_a, array_b, array_c, array_d, alpha, beta):
+def triton_grouped_gemm(array_a, array_b, alpha, beta):
     """
     grouped gemm's signature is (trans_a, trans_b
                              vector<> m, vector<> n, vector<> k
@@ -187,59 +186,40 @@ def triton_grouped_gemm(array_a, array_b, array_c, array_d, alpha, beta):
     """
     a = array_a[0]
     device = a.device
+    M = a.shape[0]
     K = a.shape[1]
-
-    # allocates output
-    m_sizes = []
-    n_sizes = []
 
     trans_a = 0
     trans_b = 0
 
-    params = []
-
-    M = array_a[0].shape[0]
-    K = array_a[0].shape[1]
+    n_sizes = []
     for b in array_b:
         N = b.shape[1]
         n_sizes.append(N)
 
     a_matrix = torch.concat(array_a, dim=0)
     b_matrix = torch.concat(array_b, dim=1)
-    c_matrix = torch.concat(array_c, dim=1)  # n is different between matrix
+    c_matrix = torch.zeros((M, sum(n_sizes)), device=device, dtype=a.dtype)  # n is different between matrix
+
+    print('a shape: ', a_matrix.shape, ' b shape: ', b_matrix.shape, ' c shape: ', c_matrix.shape)
 
     # convert list into cuda tensors
     n_sizes_tensor = torch.tensor(tuple(n_sizes), dtype=torch.int32, device=device)
 
     # T(C=AB) ==> T(C) = T(B) * T(A), column-major
     # launch kernel
-    def get_grid(**kwargs):
-        m = kwargs['M']
-        n_sizes_tensor = kwargs['n_array']
-        BLOCK_M = kwargs['BLOCK_M']
-        BLOCK_N = kwargs['BLOCK_N']
-        num = kwargs['num_of_matrix']
-
-        ret = 0
-        m = (m / BLOCK_M).ceil().to(torch.int32)
-        n = (n_sizes_tensor / BLOCK_N).ceil().to(torch.int32)
-        ret = sum(m * n)
-        #ret = sum(m)
-        #print('grid: ', ret)
-        
-        return (ret,)
     #grid = lambda META: get_grid(**META)
-    grid = (100,)
+    grid = (160,)
     grouped_gemm_kernel[grid](len(array_a),
                   n_sizes_tensor, M, K,
                   alpha,
-                  b_matrix,
+                  b_matrix,  # NxK, column-major, stride=N
+                  sum(n_sizes),
+                  a_matrix,  # KxM, column-major, stride=K
                   K,
-                  a_matrix,
-                  M,
                   beta,
-                  c_matrix,
-                  M,
+                  c_matrix,  # NxM, column-major, stride=N
+                  sum(n_sizes),
                   DTYPE=tl.float32 if array_a[0].dtype == torch.float32 else tl.float16,
                   ACC_DTYPE=tl.float32,
                   TRANS_A=trans_b, TRANS_B=trans_a,  # 0 for N, 1 for T
@@ -258,15 +238,7 @@ def triton_groupedgemm_wrap(list_a, list_b):
     list_a is a list of tensor a, with shape MxK, where M may be different.
     b is a tensor, with shape KxN.
     """
-    list_c = []
-    for a,b in zip(list_a, list_b):
-      M,K = a.shape[0], a.shape[1]
-      K1,N = b.shape[0], b.shape[1]
-      assert K == K1
-      c = torch.zeros((M, N), device=a.device, dtype=a.dtype)
-      list_c.append(c)
-
-    triton_grouped_gemm(list_a, list_b, list_c, list_c, 1.0, 0.0)
+    list_c = triton_grouped_gemm(list_a, list_b, 1.0, 0.0)
 
     return list_c
 
