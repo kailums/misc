@@ -5,9 +5,9 @@ import triton.language as tl
 
 
 @triton.jit
-def double_while_loop_vector_add(num_vec, vec_sizes, vec_a, vec_b, vec_res, BLOCK: tl.constexpr):
+def double_while_loop_vector_add(num_vec: tl.constexpr, vec_sizes, vec_a, vec_b, vec_res, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    num_pids = tl.program_id(0)
+    num_pids = tl.num_programs(0)
 
     i = 0
     vec_size_sum = 0
