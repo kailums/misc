@@ -10,6 +10,10 @@ find_package(CUDA REQUIRED)
 
 add_executable(main main.cu hand_gemm.cu)
 
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_70,code=sm_70")
+
+target_compile_options(main PRIVATE -lineinfo)
+
 target_include_directories(main PRIVATE "/usr/local/cuda/include")
 target_link_directories(main PRIVATE "/usr/local/cuda/lib64")
 target_link_libraries(main PRIVATE -lcudart -lcublas -lcufft -lcuda -ldl -lrt -lstdc++)
