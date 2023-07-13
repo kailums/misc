@@ -32,9 +32,9 @@ void print_matrix(std::string name, std::vector<float> &M, int rows, int cols) {
 
 int main() {
     // Matrix dimensions
-    int M = 768;
-    int N = 128;
-    int K = 4096;
+    int M = 2048;
+    int N = 2048;
+    int K = 1024;
 
     // Host matrices
 	std::vector<float> h_A(M*K);
@@ -92,6 +92,8 @@ int main() {
     CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, size_C, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    // set output buffer to 0
+    CUDA_CHECK(cudaMemset(d_C, 0, size_C));
 
     // using hand_gemm
     CUDA_CHECK(hand_gemm(0, M, N, K, d_A, K, d_B, N, d_C, N, alpha, beta));
