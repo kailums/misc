@@ -89,12 +89,11 @@ def get_dummy_inputs(model_name, batch, seq_len, past_seq_len, device):
     return {k: v for k, v in zip(input_names, inputs)}
 
 def get_model(args, name):
-    config = AutoConfig.from_pretrained(name)
-    config.n_layer=2
-    config.alibi=True
+    config = AutoConfig.from_pretrained(name, trust_remote_code=True)
+    #config.n_layer=2
     #model = LlamaForCausalLM(config)
     #model = LlamaForCausalLM.from_pretrained(name, torch_dtype=config.torch_dtype, config=config)
-    model = AutoModelForCausalLM.from_pretrained(name, config=config)
+    model = AutoModelForCausalLM.from_pretrained(name, config=config, trust_remote_code=True, torch_dtype=torch.float16 if args.fp16 else None)
     return config, model
 
 
@@ -159,8 +158,9 @@ def export_model(args, model, config, local_rank, inputs, input_names, output_na
     if args.opt_export:
         model_type = 'bert'
         opt_option=FusionOptions(model_type)
-        opt_option.enable_attention=False
-        opt_option.enable_flash_attention=False
+        opt_option.enable_attention=True
+        opt_option.enable_flash_attention=True
+        opt_option.enable_embed_layer_norm=False
         optimizer = optimize_by_fusion(
                 onnx.load(model_out_file), 
                 model_type=model_type,

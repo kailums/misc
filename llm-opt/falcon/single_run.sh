@@ -18,7 +18,7 @@ export MIOPEN_FIND_MODE=NORMAL
 
 
 BATCH=2
-SEQ_LEN=127
+SEQ_LEN=128
 MODEL_NAME='tiiuae/falcon-7b'
 
 #if [[ $OMPI_COMM_WORLD_LOCAL_RANK -eq 0 ]]
@@ -33,13 +33,13 @@ MODEL_NAME='tiiuae/falcon-7b'
 #fi
 
 
-CMD="python3 falcon.py --model=$MODEL_NAME --batch=$BATCH --seq-len=$SEQ_LEN --output model-falcon-7b-fp16-layer2.onnx"
+CMD="python falcon.py --model=$MODEL_NAME --batch=$BATCH --seq-len=$SEQ_LEN --output model-falcon-7b-fp16.onnx"
 
 
 #$PROF $CMD --export --fp16 --opt-export --no-ort-infer --no-torch-infer --tune --loop-cnt=2 #--ort-opt
-#$PROF $CMD --export --fp16 --opt-export --tune --loop-cnt=50 #--ort-opt
-$CMD --no-ort-infer --loop-cnt=2
-#$CMD --export --fp16 --opt-export --ort-opt --tune --loop-cnt=50
+$PROF $CMD --export --fp16 --opt-export --tune --loop-cnt=50 #--ort-opt
+#$CMD --no-ort-infer --loop-cnt=2
+#$CMD --export --ort-opt --tune --loop-cnt=50
 #$CMD  --export 
 #$PROF $CMD --loop-cnt=10 --save-dir=$SAVE_DIR #--tune
 #$PROF $CMD --no-torch-infer --save-dir=$SAVE_DIR --tune --loop-cnt=20 #--ort-opt
