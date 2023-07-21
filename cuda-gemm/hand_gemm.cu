@@ -149,13 +149,13 @@ __device__ inline void load_gmem_to_smem_A_trans(const float* ptr, int step, flo
   #pragma unroll
   for (int i = threadIdx.y; i < BLOCK_Y; i += blockDim.y) {
     #pragma unroll
-    for (int j = threadIdx.x; j < BLOCK_X / 4; j += blockDim.x) {
-      //reinterpret_cast<float4*>(dst + j * BLOCK_Y)[i] = reinterpret_cast<const float4*>(ptr + i *step)[j];
-      float4 tmp = reinterpret_cast<const float4*>(ptr + i *step)[j];
-      (dst + j * 4 * BLOCK_Y)[i] = tmp.x;
-      (dst + (j * 4 +1) * BLOCK_Y)[i] = tmp.y;
-      (dst + (j * 4 +2) * BLOCK_Y)[i] = tmp.z;
-      (dst + (j * 4 +3) * BLOCK_Y)[i] = tmp.w;
+    for (int j = threadIdx.x; j < BLOCK_X; j += blockDim.x) {
+      (dst + j * BLOCK_Y)[i] = (ptr + i * step)[j];
+      // float tmp = (ptr + i *step)[j];
+      // (dst + j * 4 * BLOCK_Y)[i] = tmp.x;
+      // (dst + (j * 4 +1) * BLOCK_Y)[i] = tmp.y;
+      // (dst + (j * 4 +2) * BLOCK_Y)[i] = tmp.z;
+      // (dst + (j * 4 +3) * BLOCK_Y)[i] = tmp.w;
     }
   }
 }
@@ -528,25 +528,31 @@ __global__ void hand_gemm_kernel_blockmn_shared_l2_prefetch_splitK_transA_8x8(in
   int kk = blockIdx.z * k_step;
   int K_end = kk + k_step;
 
-  load_gmem_to_smem_A_trans<BLOCK_M, BLOCK_K>(A + block_y_offset*lda + kk, lda, sm_A[sm_id]);
-  load_gmem_to_smem_B<BLOCK_K, BLOCK_N>(B + kk*ldb + block_x_offset, ldb, sm_B[sm_id]);
+  auto* a_ptr = A + block_y_offset*lda + kk;
+  load_gmem_to_smem_A_trans<BLOCK_M, BLOCK_K>(a_ptr, lda, sm_A[sm_id]);
+  auto* b_ptr = B + kk * ldb + block_x_offset;
+  load_gmem_to_smem_B<BLOCK_K, BLOCK_N>(b_ptr, ldb, sm_B[sm_id]);
   __syncthreads();
 
   for (; kk < K_end; kk += BLOCK_K) {
     // load memory from global to shared
     int next_sm_id = (sm_id + 1) % 2;
     if ((kk+BLOCK_K) < K_end) {
-      load_gmem_to_smem_A_trans<BLOCK_M, BLOCK_K>(A + block_y_offset*lda + (kk + BLOCK_K), lda, sm_A[next_sm_id]);
-      load_gmem_to_smem_B<BLOCK_K, BLOCK_N>(B + (kk + BLOCK_K) * ldb + block_x_offset, ldb, sm_B[next_sm_id]);
+      a_ptr += BLOCK_K;
+      load_gmem_to_smem_A_trans<BLOCK_M, BLOCK_K>(a_ptr, lda, sm_A[next_sm_id]);
+      b_ptr += BLOCK_K * ldb;
+      load_gmem_to_smem_B<BLOCK_K, BLOCK_N>(b_ptr, ldb, sm_B[next_sm_id]);
       __syncthreads();
     }
     
+    auto* sma_ptr = sm_A[sm_id];
     #pragma unroll
     for (int kkk = 0; kkk < BLOCK_K; ++kkk) {
-      a_reg[0] = reinterpret_cast<float4*>(sm_A[sm_id] + (BLOCK_M * kkk))[threadIdx.y * 2];
-      a_reg[1] = reinterpret_cast<float4*>(sm_A[sm_id] + (BLOCK_M * kkk))[threadIdx.y * 2 + 1];
-      b_reg[0] = reinterpret_cast<float4*>(sm_B[sm_id] + (BLOCK_N * kkk))[threadIdx.x * 2];
-      b_reg[1] = reinterpret_cast<float4*>(sm_B[sm_id] + (BLOCK_N * kkk))[threadIdx.x * 2 + 1];
+      a_reg[0] = reinterpret_cast<float4*>(sma_ptr)[threadIdx.y * 2];
+      a_reg[1] = reinterpret_cast<float4*>(sma_ptr)[threadIdx.y * 2 + 1];
+      b_reg[0] = reinterpret_cast<float4*>(sma_ptr)[threadIdx.x * 2];
+      b_reg[1] = reinterpret_cast<float4*>(sma_ptr)[threadIdx.x * 2 + 1];
+      sma_ptr += BLOCK_M;
       
       compute_float4_reg_8x8(a_reg, b_reg, res);
     }
@@ -632,9 +638,9 @@ cudaError_t hand_gemm(cudaStream_t stream,
 
   const int BLOCK_M = 64;
   const int BLOCK_N = 128;
-  const int BLOCK_K = 16;
+  const int BLOCK_K = 32;
   const int GROUP_M = 4;
-  const int SPLIT_K = 8;
+  const int SPLIT_K = 1;
   dim3 block(BLOCK_N / 8, BLOCK_M / 8);
   dim3 grid(n / BLOCK_N, m / BLOCK_M, SPLIT_K);
 

@@ -19,6 +19,21 @@ extern cudaError_t hand_gemm(cudaStream_t stream,
                float* C, int ldc,
                float alpha, float beta);
 
+extern cudaError_t hand_gemm_opted(cudaStream_t stream,
+               int m, int n, int k, 
+               float* A, int lda,
+               float* B, int ldb,
+               float* C, int ldc,
+               float alpha, float beta);
+
+extern cudaError_t dense_op(cudaStream_t stream,
+               int m, int n, int k, 
+               float* A, int lda,
+               float* B, int ldb,
+               float* C, int ldc,
+               float alpha, float beta);
+
+
 // Helper function to print a matrix
 void print_matrix(std::string name, std::vector<float> &M, int rows, int cols) {
     std::cout << name << std::endl;
@@ -30,7 +45,46 @@ void print_matrix(std::string name, std::vector<float> &M, int rows, int cols) {
     }
 }
 
+
+extern void call_memory_kernel(float* dev_dst, float* dev_src, int size, cudaStream_t stream);
+
+void test_cuda_memory() {
+  int size = 2048 * 1024;
+  std::vector<float> host_src(size);
+  std::vector<float> host_dst(size);
+
+  for (int i = 0; i < size; ++i) {
+    host_src[i] = i;
+  }
+  
+  float* dev_src;
+  float* dev_dst;
+  CUDA_CHECK(cudaMalloc(&dev_src, size * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dev_dst, size * sizeof(float)));
+
+  CUDA_CHECK(cudaMemcpy(dev_src, host_src.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+
+  call_memory_kernel(dev_dst, dev_src, size, 0);
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaMemcpy(host_dst.data(), dev_dst, size * sizeof(float), cudaMemcpyDeviceToHost));
+
+  bool same = true;
+  for (int i = 0; i < size; ++i) {
+    if (host_src[i] != host_dst[i]) {
+      std::cout << "not same." << std::endl;
+      same = false;
+      break;
+    }
+  }
+  if (same) {
+    std::cout << "SAME." << std::endl;
+  }
+}
+
 int main() {
+    //test_cuda_memory();
+    //return 0;
     // Matrix dimensions
     int M = 2048;
     int N = 2048;
@@ -96,7 +150,8 @@ int main() {
     CUDA_CHECK(cudaMemset(d_C, 0, size_C));
 
     // using hand_gemm
-    CUDA_CHECK(hand_gemm(0, M, N, K, d_A, K, d_B, N, d_C, N, alpha, beta));
+    CUDA_CHECK(hand_gemm_opted(0, M, N, K, d_A, K, d_B, N, d_C, N, alpha, beta));
+    CUDA_CHECK(dense_op(0, M, N, K, d_A, K, d_B, N, d_C, N, alpha, beta));
 
     std::vector<float> h_hand_C(M*N);
     CUDA_CHECK(cudaMemcpy(h_hand_C.data(), d_C, size_C, cudaMemcpyDeviceToHost));
