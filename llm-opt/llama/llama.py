@@ -38,24 +38,32 @@ def setup_session_option(args, local_rank):
 
     return so
 
-def run_onnxruntime(args, model_file, inputs):
+def run_onnxruntime(args, model_file, inputs, past_kv_dict):
     local_rank = get_rank()
     model_file = f'{args.save_dir}/{model_file}'
     print('infer ort in rank: ', local_rank, ' m: ', model_file)
     so = setup_session_option(args, local_rank) 
-    sess = ort.InferenceSession(model_file, sess_options=so, providers=[('ROCMExecutionProvider',{'device_id':local_rank, 'tunable_op_enable': args.tune, 'tunable_op_tuning_enable': args.tune})])
+    #sess = ort.InferenceSession(model_file, sess_options=so, providers=[('ROCMExecutionProvider',{'device_id':local_rank, 'tunable_op_enable': args.tune, 'tunable_op_tuning_enable': args.tune})])
+    sess = ort.InferenceSession(model_file, sess_options=so, providers=['CPUExecutionProvider',])
     io_binding = sess.io_binding()
 
     # bind inputs by using OrtValue
     input_names = sess.get_inputs()
     for k in input_names:
-        np_data = inputs[k.name].cpu().numpy()
-        x = OrtValue.ortvalue_from_numpy(np_data, 'cuda', local_rank)
+        if k.name in inputs:
+            np_data = inputs[k.name].cpu().numpy()
+        elif k.name in past_kv_dict:
+            np_data = past_kv_dict[k.name].cpu().numpy()
+        else:
+            print('not support input name: ', k.name)
+        #x = OrtValue.ortvalue_from_numpy(np_data, 'cuda', local_rank)
+        x = OrtValue.ortvalue_from_numpy(np_data)
         io_binding.bind_ortvalue_input(k.name, x)
     # bind outputs
     outputs = sess.get_outputs()
     for out in outputs:
-        io_binding.bind_output(out.name, 'cuda', local_rank)
+        #io_binding.bind_output(out.name, 'cuda', local_rank)
+        io_binding.bind_output(out.name)
 
     sess.run_with_iobinding(io_binding)
 
@@ -73,7 +81,7 @@ def run_onnxruntime(args, model_file, inputs):
 
     return output
 
-def get_dummy_inputs(model_name, batch, seq_len, past_seq_len, device):
+def get_dummy_inputs(model_name, config, batch, seq_len, past_seq_len, device):
     tokenizer = LlamaTokenizer.from_pretrained(model_name)
 
     promt_str = ['hello'] * seq_len
@@ -82,14 +90,33 @@ def get_dummy_inputs(model_name, batch, seq_len, past_seq_len, device):
     input_ids = tokenizer(promt_str, return_tensors='pt')
     att_mask = input_ids['attention_mask'].to(device)
     input_ids = input_ids['input_ids'].to(device)
+
     print('ids shape: ', input_ids.shape, ' mask shape: ', att_mask.shape)
+    inputs = {'input_ids': input_ids, 'attention_mask': att_mask}
+    dyn_axes = {'input_ids': {0: 'batch', 1: 'seq_len'}, 'attention_mask': {0: 'batch', 1: 'mask_seq_len'}}
 
-    inputs = (input_ids, att_mask)
-    input_names = ['input_ids', 'attention_mask']
-    return {k: v for k, v in zip(input_names, inputs)}
+    # create past seq
+    past_kv_dict = {}
+    if past_seq_len > 0:
+        past_kv = []
+        dtype = torch.float16 if config.torch_dtype == 'float16' else torch.float32
+        num_heads = config.num_key_value_heads
+        head_dim = config.hidden_size // config.num_attention_heads
+        for i in range(config.num_hidden_layers):
+            key = torch.randn(batch, num_heads, past_seq_len, head_dim, dtype=dtype, device=device)
+            value = torch.randn(batch, num_heads, past_seq_len, head_dim, dtype=dtype, device=device)
+            past_kv.append([key, value])
+            past_kv_dict[f'past_key_{i}'] = key
+            past_kv_dict[f'past_value_{i}'] = value
+            dyn_axes[f'past_key_{i}'] = {0: 'batch', 2: 'past_seq_len'}
+            dyn_axes[f'past_value_{i}'] = {0: 'batch', 2: 'past_seq_len'}
+        inputs['past_key_values'] = past_kv
+        # renew attention_mask
+        input_seq_len = input_ids.shape[-1]
+        mask = torch.ones(batch, input_seq_len + past_seq_len, dtype=torch.bool, device=device)
+        inputs['attention_mask'] = mask
 
-    #input_ids = torch.ones([batch, seq_len], dtype=torch.int, device=device)
-    #return {'tokens': input_ids, 'start_pos': 1}
+    return inputs, dyn_axes, past_kv_dict
    
 def get_model(args, name):
     config = LlamaConfig.from_pretrained(name)
@@ -133,7 +160,7 @@ def run_torch_model(args, model, inputs, device):
     return output
 
 
-def export_model(args, model, config, local_rank, inputs, input_names, output_names, model_out_file, tmp_out_file, opt_out_file): 
+def export_model(args, model, config, local_rank, inputs, input_names, output_names, model_out_file, tmp_out_file, opt_out_file, dyn_axes): 
     # sync all process
     print('start to export model')
 
@@ -144,6 +171,7 @@ def export_model(args, model, config, local_rank, inputs, input_names, output_na
             args=inputs,
             input_names=input_names,
             output_names=output_names,
+            dynamic_axes=dyn_axes,
             opset_version=15,
             verbose=False,
             operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH,
@@ -202,12 +230,14 @@ def compare(args, nparray1, nparray2):
 def main(args):
     batch=args.batch
     seq_len=args.seq_len
+    past_seq_len = args.past_seq_len
     model_name = f'{args.model}'
 
     local_rank = get_rank()
-    device = torch.device(f"cuda:{local_rank}")
+    #device = torch.device(f"cuda:{local_rank}")
+    device = torch.device('cpu')
 
-    torch.cuda.set_device(device)
+    #torch.cuda.set_device(device)
     torch.cuda.manual_seed(42)
 
     config, model = get_model(args, model_name)
@@ -216,26 +246,31 @@ def main(args):
         model.to(device)
         model.eval()
         model.requires_grad_(False)
-        # if args.fp16:
-        #     model.half()
 
-    inputs = get_dummy_inputs(model_name, batch, seq_len, None, device)
-    input_names = list(inputs.keys())
-    output_names = ['output']
+    inputs, dyn_axes, past_kv_dict = get_dummy_inputs(model_name, config, batch, seq_len, past_seq_len, device)
+    input_names = ['input_ids', 'attention_mask'] + list(past_kv_dict.keys())
+    output_names = ['logits']
+    dyn_axes['logits'] = {0: 'batch', 1: 'seq_len'}
+    if config.use_cache:
+        for i in range(config.num_hidden_layers):
+            output_names.append(f'present.{i}.key')
+            output_names.append(f'present.{i}.value')
+            dyn_axes[f'present.{i}.key'] = {0: 'batch'}
+            dyn_axes[f'present.{i}.value'] = {0: 'batch'}
 
     # export to onnx
     model_out_file = f'rank-{local_rank}-{args.output}'
     tmp_file = f'tmp-{model_out_file}'
     opt_out_file = f'opt-{model_out_file}'
     if args.export:
-        export_model(args, model, config, local_rank, inputs, input_names, output_names, model_out_file, tmp_file, opt_out_file)
+        export_model(args, model, config, local_rank, inputs, input_names, output_names, model_out_file, tmp_file, opt_out_file, dyn_axes)
 
     if not args.no_torch_infer:
         output = run_torch_model(args, model, inputs, device)
 
     if not args.no_ort_infer:
         #model_out_file = './llama-7b-hf/decoder_model.onnx'
-        ort_out = run_onnxruntime(args, opt_out_file if args.opt_export else model_out_file, inputs)
+        ort_out = run_onnxruntime(args, opt_out_file if args.opt_export else model_out_file, inputs, past_kv_dict)
 
     if args.no_torch_infer or args.no_ort_infer:
         return
@@ -255,6 +290,7 @@ def get_arges():
     parser.add_argument('--profile', action='store_true', default=False)
     parser.add_argument('--batch', type=int)
     parser.add_argument('--seq-len', type=int)
+    parser.add_argument('--past-seq-len', type=int)
     parser.add_argument('--export', action='store_true', default=False)
     parser.add_argument('--fp16', action='store_true', default=False)
     parser.add_argument('--no-torch-infer', action='store_true', default=False)
