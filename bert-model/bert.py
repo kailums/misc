@@ -56,13 +56,14 @@ def barrier():
     comm.Barrier()
 
 def setup_session_option(args, local_rank):
+    #os.environ['ORT_TRITON_LIB_PATH'] = ort.__path__[0] + '/triton_libs'
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.intra_op_num_threads = psutil.cpu_count(logical=False)
     so.log_severity_level = 4 # 0 for verbose
-    #if local_rank == 0:
-    #    so.log_severity_level = 0
-    #    ort.set_default_logger_severity(0)  # open log
+    if local_rank == 3:
+        so.log_severity_level = 0
+        ort.set_default_logger_severity(0)  # open log
     if args.ort_opt:
         so.optimized_model_filepath = f'ort-opted-rank-{local_rank}-{args.output}'
 
@@ -77,7 +78,7 @@ def run_onnxruntime(args, model_file, inputs):
     model_file = f'{args.save_dir}/{model_file}'
     print('infer ort in rank: ', local_rank, ' m: ', model_file)
     so = setup_session_option(args, local_rank) 
-    sess = ort.InferenceSession(model_file, sess_options=so, providers=[('ROCMExecutionProvider',{'device_id':local_rank, 'tunable_op_enabled': args.tune})])
+    sess = ort.InferenceSession(model_file, sess_options=so, providers=[('ROCMExecutionProvider',{'device_id':local_rank, 'tunable_op_enable': args.tune, 'tunable_op_tuning_enable': args.tune})], disabled_optimizers=['BiasSoftmaxFusion'])
     io_binding = sess.io_binding()
 
     # bind inputs by using OrtValue
@@ -110,10 +111,14 @@ def run_onnxruntime(args, model_file, inputs):
 def get_dummy_inputs(model_name, batch, seq_len, past_seq_len, device):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     #input_str = 'hello world' * (seq_len // 2)
-    promt_str = 'Here is some text to encode Hello World'
+    #promt_str = 'Here is some text to encode Hello World'
+    promt_str = ['hello'] * seq_len
+    promt_str = ' '.join(promt_str)
+    promt_str = [promt_str] * batch
     input_ids = tokenizer(promt_str, return_tensors='pt')
     att_mask = input_ids['attention_mask'].to(device)
     input_ids = input_ids['input_ids'].to(device)
+    print('ids shape: ', input_ids.shape, ' mask shape: ', att_mask.shape)
 
     inputs = (input_ids, att_mask)
     input_names = ['input_ids', 'attention_mask']
