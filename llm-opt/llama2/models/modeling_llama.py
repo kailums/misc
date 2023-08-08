@@ -748,6 +748,15 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def parallel_model(self):
+        def _split_model(model):
+            if isinstance(model, TensorParallelColumnLinear) or isinstance(model, TensorParallelRowLinear) or isinstance(model, LlamaAttention):
+                model.parallel_split()
+            for _, m in model._modules.items():
+                _split_model(m)
+
+        _split_model(self)
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 

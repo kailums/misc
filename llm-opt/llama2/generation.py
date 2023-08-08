@@ -99,16 +99,16 @@ class OrtModel:
                 k_cache = i
 
         self.tokenizer = tokenizer
-        hidden_size = input_x.shape[2]
+        self.hidden_size = input_x.shape[2]
         self.max_seq_len = input_attn_mask.shape[1]
         self.n_layers = k_cache.shape[1]
         self.n_heads = k_cache.shape[3]
         self.dtype = torch.float16 if input_x.type == 'tensor(float16)' else torch.float32
         self.attn_mask_shape = input_attn_mask.shape
-        self.head_dim = hidden_size // self.n_heads
+        self.head_dim = self.hidden_size // self.n_heads
 
         # load embedding
-        self.emb = torch.nn.Embedding(tokenizer.n_words, hidden_size)
+        self.emb = torch.nn.Embedding(tokenizer.n_words, self.hidden_size)
         self.emb.load_state_dict(torch.load(args.emb_file))
         self.emb.eval()
         self.emb.requires_grad_(False)
@@ -116,6 +116,20 @@ class OrtModel:
         self.device = torch.device(local_rank)
         #self.emb.to(self.device)
         self.rank = local_rank
+
+    def optimize(self, args):
+        model_type = 'bert'
+        opt_option = FusionOptions(model_type)
+        opt_option.enable_attention = False
+        opt_option.enable_flash_attention = False
+        optimizer = optimize_by_fusion(
+                onnx.load(args.model_file),
+                model_type=model_type,
+                num_heads = self.n_heads,
+                hidden_size = self.hidden_size,
+                optimization_options=opt_option
+            )
+        optimizer.save_model_to_file(args.output, use_external_data_format=True)
 
     def forward_with_io_binding(self, tokens, attn_mask, past_k, past_v, pos):
         x = self.emb(tokens)
@@ -232,9 +246,10 @@ def run_benchmark(args, local_rank):
 
     batch=1
     #prompt_len = ['32', '64', '128', '256', '512', '1024']
-    prompt_len = ['2017']
+    #prompt_len = ['2017']
+    prompt_len = ['32']
     #generate_len = [1, 129]
-    generate_len = [4]
+    generate_len = [3]
 
     for p_len in prompt_len:
         for gen_len in generate_len:
@@ -249,6 +264,10 @@ def run_benchmark(args, local_rank):
 
             func_benchmark(args, "ORT", ort_model, prompt, prompt_len, gen_len)
 
+def optimize_model(args):
+    tokenizer = setup_tokenizer(args)
+    ort_model = OrtModel(args, tokenizer, local_rank)
+    ort_model.optimize()
 
 def main(args):
     local_rank = 2

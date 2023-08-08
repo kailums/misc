@@ -19,9 +19,12 @@ export MIOPEN_FIND_MODE=NORMAL
 #$PROF $GENRATE --ort --benchmark --loop-cnt=2 --warm=1 --tune --profile #--ort-opt --output=llamav2.onnx --tune #--generate #--export
 #$PROF $GENRATE --ort --generate #--ort-opt --output=llamav2.onnx --tune #--generate #--export
 
-MODEL_NAME="meta-llama/Llama-2-70b-hf"
+MODEL_NAME="Llama-2-70b-hf"
+OUTPUT_NAME="$MODEL_NAME"
 
-CMD="python3 llama-v2.py --model=$MODEL_NAME "
+CMD="python3 llama-v2.py --model=meta-llama/$MODEL_NAME --output_name=$OUTPUT_NAME "
 
+$PROF $CMD --export --verbose #--convert_fp16
 #$PROF $CMD --generate --torch
-$PROF $CMD --benchmark --torch --loop-cnt=10 --warm=2
+#$PROF $CMD --generate --ort --torch
+#$PROF $CMD --benchmark --torch --loop-cnt=10 --warm=2
