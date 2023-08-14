@@ -13,7 +13,6 @@ import numpy as np
 from mpi4py import MPI
 
 import onnxruntime as ort
-from onnxruntime import OrtValue
 from onnxruntime.transformers.optimizer import optimize_by_fusion
 from onnxruntime.transformers.fusion_options import FusionOptions
 from onnxruntime.transformers.onnx_model import OnnxModel  # noqa: E402
@@ -88,9 +87,9 @@ def setup_session_option(args, local_rank):
     if args.ort_opt:
         so.optimized_model_filepath = f'ort-opted-rank-{local_rank}-{args.output}'
 
-    if args.profile:
+    if args.profile and local_rank == 0:
         so.enable_profiling = args.profile
-        so.profile_file_prefix=f'ort-profile-rank{local_rank}'
+        so.profile_file_prefix=f'ort-profile-rank-{local_rank}'
 
     provider_opt = {'device_id': local_rank, 'tunable_op_enable': args.tune, 'tunable_op_tuning_enable': args.tune}
 
@@ -101,8 +100,9 @@ def setup_ort_model(args, rank):
     #config.num_hidden_layers = 2
     decoder_model = f"{args.output_name}_rank-{rank}_decoder_model_fp32.onnx"
     decoder_past_model = f"{args.output_name}_rank-{rank}_decoder_with_past_model_fp32.onnx"
-    
-    model = OrtModelForLlamaCausalLM(args, decoder_model, decoder_past_model, rank, config=config)
+    sess_opt, provider_opt = setup_session_option(args, rank)
+
+    model = OrtModelForLlamaCausalLM(args, decoder_model, decoder_past_model, rank, sess_opt, provider_opt, config=config)
     model.to(torch.device(rank))
 
     return model
@@ -128,6 +128,8 @@ def setup_torch_model(args, use_cuda=True):
                 model.to(torch.device(rank))
             model.eval()
             model.requires_grad_(False)
+            if args.compile:
+                model = torch.compile(model)
         barrier()
     return model
 
@@ -166,24 +168,26 @@ def run_generate(args, local_rank):
     tokenizer = LlamaTokenizer.from_pretrained(args.model)
     #prompt='Q: What is the largest animal?\nA:'
     prompt='Once upon a time,'
-    
+    #prompt='Q: there are two sets of nodes in a graph, each node in one set is connecting to all nodes in the other set, what is graph called?\nA:'
+
     inputs = tokenizer(prompt, return_tensors='pt')
 
     if args.ort:
         ort_model = setup_ort_model(args, local_rank)
         input_ids = inputs.input_ids.to(ort_model.device)
-        outputs = ort_model.generate(input_ids=input_ids, max_new_tokens=32)
+        outputs = ort_model.generate(input_ids=input_ids, max_new_tokens=128)
         print_out('input ids size: ', inputs.input_ids.shape, ' value: ', inputs.input_ids)
         print_out('output size: ', outputs[0].shape, ' value: ', outputs[0])
-    
+        print_out('ort cost: ', ort_model.cost, ' iters: ', ort_model.iters)
+
         response = tokenizer.decode(outputs[0][1:], skip_special_token=True)
         print_out('[ORT] Response:', response)
 
-    
+
     if args.torch:
         torch_model = setup_torch_model(args, use_cuda=True)
         input_ids = inputs.input_ids.to(torch_model.device)
-        outputs = torch_model.generate(input_ids=input_ids, max_new_tokens=32)
+        outputs = torch_model.generate(input_ids=input_ids, max_new_tokens=128)
         response = tokenizer.decode(outputs[0][1:], skip_special_token=True)
         print_out('output size: ', outputs[0].shape, ' value: ', outputs[0])
         print_out('[Torch] Response:', response)
@@ -198,6 +202,7 @@ def func_benchmark(args, name, ort_model, input_ids, gen_len):
     for _ in range(args.loop_cnt):
         torch.cuda.nvtx.range_push('generate')
         outputs = ort_model.generate(input_ids = input_ids, max_new_tokens=gen_len)
+        #print_out('ort cost: ', ort_model.cost, ' iters: ', ort_model.iters)
         torch.cuda.nvtx.range_pop()
     cost = time.time() - start
     print_out(f'[{name}]: prmpot_len: {input_ids.shape[1]}, generate_len: {gen_len}, cost: {cost / args.loop_cnt}s')
@@ -205,14 +210,19 @@ def func_benchmark(args, name, ort_model, input_ids, gen_len):
 def run_benchmark(args, local_rank):
     tokenizer = LlamaTokenizer.from_pretrained(args.model)
 
+    if args.ort:
+        ort_model = setup_ort_model(args, local_rank)
+
     if args.torch:
         torch_model = setup_torch_model(args, use_cuda=True)
 
     batch=1
-    prompt_len = ['32', '64', '128', '256', '512', '1024']
-    #prompt_len = ['32']
+    #prompt_len = ['32', '64', '128', '256', '512', '1024']
+    prompt_len = ['32', '64']
+    #prompt_len = ['2017']
+    #prompt_len = ['1024']
     generate_len = [1, 129]
-    #generate_len = [1]
+    #generate_len = [3]
 
     for p_len in prompt_len:
         for gen_len in generate_len:
@@ -222,11 +232,15 @@ def run_benchmark(args, local_rank):
             if p_len in prompt_pool:
                 prompt = prompt_pool[p_len]
             else:
-                prompt = ['Hello'] * (int(p_len) - 1)
+                prompt = ['Hello'] * int(p_len)
                 prompt = ' '.join(prompt)
 
             inputs = tokenizer(prompt, return_tensors='pt')
-            
+
+            if args.ort:
+                input_ids = inputs.input_ids.to(ort_model.device)
+                func_benchmark(args, "ORT", ort_model, input_ids, gen_len)
+
             if args.torch:
                 input_ids = inputs.input_ids.to(torch_model.device)
                 func_benchmark(args, "Torch", torch_model, input_ids, gen_len)
@@ -255,7 +269,7 @@ def get_arges():
     parser.add_argument('--interval', type=int, default=100)
     parser.add_argument('--profile', action='store_true', default=False)
     parser.add_argument('--export', action='store_true', default=False)
-    parser.add_argument('--merge', action='store_true', default=False)
+    parser.add_argument('--compile', action='store_true', default=False)
     parser.add_argument('--tune', action='store_true', default=False)
     parser.add_argument('--ort-opt', action='store_true', default=False)
     parser.add_argument('--logging', action='store_true', default=False)

@@ -13,6 +13,7 @@ import onnx
 import onnxruntime as ort
 from onnxruntime.transformers.optimizer import optimize_by_fusion
 from onnxruntime.transformers.fusion_options import FusionOptions
+from onnxruntime.training.ortmodule._utils import _ortvalues_to_torch_tensor
 
 from transformers import AutoConfig, AutoTokenizer, AutoModel, GenerationMixin, PreTrainedModel, GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -27,35 +28,16 @@ ORT_TYPE_TO_NP_TYPE = {
         'tensor(bool)': bool,
         }
 
-def setup_session_option(args, local_rank):
-    so = ort.SessionOptions()
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    so.intra_op_num_threads = psutil.cpu_count(logical=False)
-    so.log_severity_level = 4 # 0 for verbose
-    if args.logging:
-        so.log_severity_level = 0
-        ort.set_default_logger_severity(0)  # open log
-
-    if args.ort_opt:
-        so.optimized_model_filepath = f'ort-opted-rank-{local_rank}-{args.output}'
-
-    if args.profile:
-        so.enable_profiling = args.profile
-        so.profile_file_prefix=f'ort-profile-rank{local_rank}'
-
-    provider_opt = {'device_id': local_rank, 'tunable_op_enable': args.tune, 'tunable_op_tuning_enable': args.tune}
-
-    return so, provider_opt
-
-
 class OrtModelForLlamaCausalLM(PreTrainedModel):
-    def __init__(self, args, decoder_model, decoder_past_model, local_rank, **kwargs):
+    def __init__(self, args, decoder_model, decoder_past_model, local_rank, sess_opt, provider_opt, **kwargs):
         super().__init__(**kwargs)
         self.main_input_name = 'input_ids'
         self.one = nn.Parameter(torch.tensor([0]), requires_grad=False)
-        sess_opt, provider_opt = setup_session_option(args, local_rank)
  
         self.sess = ort.InferenceSession(decoder_model, sess_options=sess_opt, providers=[('ROCMExecutionProvider', provider_opt)])
+
+        if sess_opt.enable_profiling:
+            sess_opt.profile_file_prefix=sess_opt.profile_file_prefix + '_past'
         self.sess_with_past = ort.InferenceSession(decoder_past_model, sess_options=sess_opt, providers=[('ROCMExecutionProvider', provider_opt)])
 
         for i in self.sess_with_past.get_inputs():
@@ -76,6 +58,9 @@ class OrtModelForLlamaCausalLM(PreTrainedModel):
         self.vocb_size = logits.shape[2]
         self.torch_dtype = config.torch_dtype
         self.rank = local_rank
+        self.cost = 0
+        self.skip_warm = 2
+        self.iters = 0
 
     def can_generate(self):
         return True
@@ -108,37 +93,45 @@ class OrtModelForLlamaCausalLM(PreTrainedModel):
                 )
 
         outputs = []
-        output = torch.empty((*input_ids.shape, self.vocb_size), dtype=torch.float32, device=self.device)
-        seq_len = input_ids.shape[-1]
-        if past_kvs is not None:
-            seq_len += past_kvs[0].shape[2]
+        #output = torch.empty((*input_ids.shape, self.vocb_size), dtype=torch.float32, device=self.device)
+        #seq_len = input_ids.shape[-1]
+        #if past_kvs is not None:
+        #    seq_len += past_kvs[0].shape[2]
 
-        name_map['logits'] = output
-        outputs.append(output)
+        #name_map['logits'] = output
+        #outputs.append(output)
 
-        present_kv_shape = (input_ids.shape[0], self.num_heads, seq_len, self.head_dim)
-        for i in range(self.n_layers):
-            k = torch.empty(present_kv_shape, dtype=self.torch_dtype, device=self.device)
-            name_map[f'present.{i}.key'] = k
-            outputs.append(k)
-            v = torch.empty(present_kv_shape, dtype=self.torch_dtype, device=self.device)
-            name_map[f'present.{i}.value'] = v
-            outputs.append(v)
+        #present_kv_shape = (input_ids.shape[0], self.num_heads, seq_len, self.head_dim)
+        #for i in range(self.n_layers):
+        #    k = torch.empty(present_kv_shape, dtype=self.torch_dtype, device=self.device)
+        #    name_map[f'present.{i}.key'] = k
+        #    outputs.append(k)
+        #    v = torch.empty(present_kv_shape, dtype=self.torch_dtype, device=self.device)
+        #    name_map[f'present.{i}.value'] = v
+        #    outputs.append(v)
 
         for out in sess.get_outputs():
-            t = name_map[out.name]
+            #t = name_map[out.name]
             io_binding.bind_output(
                     out.name,
                     'cuda',
                     self.rank,
-                    ORT_TYPE_TO_NP_TYPE[out.type],
-                    tuple(t.shape),
-                    t.data_ptr(),
+                    #ORT_TYPE_TO_NP_TYPE[out.type],
+                    #tuple(t.shape),
+                    #t.data_ptr(),
                 )
 
+        start = time.time()
         io_binding.synchronize_inputs()
         sess.run_with_iobinding(io_binding)
         io_binding.synchronize_outputs()
+        if past_kvs is not None:
+            self.iters += 1
+            if self.iters >= self.skip_warm:
+                self.cost += time.time() - start
+
+        outputs = io_binding.get_outputs_as_ortvaluevector()
+        outputs = _ortvalues_to_torch_tensor(outputs) 
         return outputs
 
     def prepare_inputs_for_generation(self, input_ids, attention_mask=None, past_key_values=None, **kwargs):
@@ -161,7 +154,6 @@ class OrtModelForLlamaCausalLM(PreTrainedModel):
         return model_inputs
 
     def forward(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, **kwargs):
-
         results = self.forward_with_io_binding(input_ids, attention_mask, position_ids, past_key_values)
         logits, past_key_values = results[0], results[1:]
 

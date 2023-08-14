@@ -210,6 +210,8 @@ def run_torchscript_export(args: argparse.Namespace, l_config: LlamaConfig, llam
         dynamic_axes=dynamic_axes,
         opset_version=17,
         do_constant_folding=True,
+        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH,
+        custom_opsets={'com.microsoft':1},
         verbose=args.verbose,
     )
 

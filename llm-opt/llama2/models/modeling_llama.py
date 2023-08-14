@@ -83,11 +83,14 @@ class LlamaRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        torch.cuda.nvtx.range_push('LN')
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        ret = self.weight * hidden_states.to(input_dtype)
+        torch.cuda.nvtx.range_pop()
+        return ret
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
@@ -180,13 +183,27 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
-    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
-    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    # cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+    # sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    cos = cos.reshape(cos.shape[2], cos.shape[3])
+    sin = sin.reshape(sin.shape[2], sin.shape[3])
     cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+class RotaryEmbedding(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, position_ids, cos_cache, sin_cache) -> (torch.Tensor, torch.Tensor):
+        seq_len = k.shape[-2]
+        cos = cos_cache[:,:,:seq_len,...].to(k.dtype)
+        sin = sin_cache[:,:,:seq_len,...].to(k.dtype)
+        return apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+    
+    @staticmethod
+    def symbolic(g: torch.Graph, q, k, position_ids, cos_cache, sin_cache) -> (torch.Value, torch.Value):
+        return g.op('com.microsoft::RotaryEmbedding', q, k, position_ids, cos_cache, sin_cache, outputs=2)
 
 
 class LlamaMLP(nn.Module):
@@ -201,6 +218,7 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        torch.cuda.nvtx.range_push('MLP')
         if self.config.pretraining_tp > 1:
             slice = self.intermediate_size // self.config.pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
@@ -219,6 +237,7 @@ class LlamaMLP(nn.Module):
             down_proj = sum(down_proj)
         else:
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        torch.cuda.nvtx.range_pop()
 
         return down_proj
 
@@ -258,7 +277,7 @@ class LlamaAttention(nn.Module):
         self.v_proj = TensorParallelColumnLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = TensorParallelRowLinear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self._init_rope()
-    
+
     def parallel_split(self):
         world_size = get_world_size()
         self.num_heads = self.num_heads // world_size
@@ -293,6 +312,7 @@ class LlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        torch.cuda.nvtx.range_push('attention')
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
@@ -324,8 +344,11 @@ class LlamaAttention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        torch.cuda.nvtx.range_push('rotary_emb')
+        #cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        #query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        query_states, key_states = RotaryEmbedding.apply(query_states, key_states, position_ids, self.rotary_emb.cos_cached, self.rotary_emb.sin_cached)
+        torch.cuda.nvtx.range_pop()
 
         if past_key_value is not None:
             # reuse k, v, self_attention
@@ -377,6 +400,7 @@ class LlamaAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
+        torch.cuda.nvtx.range_pop()
         return attn_output, attn_weights, past_key_value
 
 
