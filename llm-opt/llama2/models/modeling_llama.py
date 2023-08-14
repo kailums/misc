@@ -195,8 +195,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
 class RotaryEmbedding(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, position_ids, cos_cache, sin_cache) -> (torch.Tensor, torch.Tensor):
+    def forward(ctx, q, k, position_ids, past_key_value, cos_cache, sin_cache) -> (torch.Tensor, torch.Tensor):
         seq_len = k.shape[-2]
+        if past_key_value is not None:
+            seq_len += past_key_value[0].shape[-2]
         cos = cos_cache[:,:,:seq_len,...].to(k.dtype)
         sin = sin_cache[:,:,:seq_len,...].to(k.dtype)
         return apply_rotary_pos_emb(q, k, cos, sin, position_ids)
@@ -347,7 +349,7 @@ class LlamaAttention(nn.Module):
         torch.cuda.nvtx.range_push('rotary_emb')
         #cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         #query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        query_states, key_states = RotaryEmbedding.apply(query_states, key_states, position_ids, self.rotary_emb.cos_cached, self.rotary_emb.sin_cached)
+        query_states, key_states = RotaryEmbedding.apply(query_states, key_states, position_ids, past_key_value, self.rotary_emb.cos_cached, self.rotary_emb.sin_cached)
         torch.cuda.nvtx.range_pop()
 
         if past_key_value is not None:
