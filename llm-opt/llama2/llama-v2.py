@@ -23,6 +23,7 @@ from models.modeling_llama import LlamaForCausalLM
 
 from export_to_onnx import run_torchscript_export
 from ort_llama import OrtModelForLlamaCausalLM
+from chatcli import chat_loop, generate_stream, generate, DistChatIO
 
 
 def init_dist():
@@ -97,7 +98,7 @@ def setup_session_option(args, local_rank):
 
 def setup_ort_model(args, rank):
     config = LlamaConfig.from_pretrained(args.model)
-    config.num_hidden_layers = 2
+    #config.num_hidden_layers = 2
     decoder_model = f"{args.output_name}_rank-{rank}_decoder_model_fp32.onnx"
     decoder_past_model = f"{args.output_name}_rank-{rank}_decoder_with_past_model_fp32.onnx"
     sess_opt, provider_opt = setup_session_option(args, rank)
@@ -120,7 +121,7 @@ def setup_torch_model(args, use_cuda=True):
     for i in range(world_size):
         if i == rank:
             config = LlamaConfig.from_pretrained(args.model)
-            config.num_hidden_layers=2
+            #config.num_hidden_layers=2
             model = LlamaForCausalLM.from_pretrained(args.model, torch_dtype=config.torch_dtype, config=config)
             model.parallel_model()
             if use_cuda:
@@ -153,7 +154,7 @@ def optimize_transformer(args, model_file, opt_out_file, num_heads, hidden_size)
 def export_model(args):
     rank = get_rank()
     config = LlamaConfig.from_pretrained(args.model)
-    config.num_hidden_layers = 2
+    #config.num_hidden_layers = 2
     world_size = get_size()
 
     # used for attention fusion, should split by TensorParallel
@@ -255,6 +256,30 @@ def run_benchmark(args, local_rank):
                 input_ids = inputs.input_ids.to(torch_model.device)
                 func_benchmark(args, "Torch", torch_model, input_ids, gen_len)
 
+def run_chat(args, local_rank):
+    tokenizer = LlamaTokenizer.from_pretrained(args.model)
+
+    if args.ort:
+        model = setup_ort_model(args, local_rank)
+
+    if args.torch:
+        model = setup_torch_model(args, use_cuda=True)
+
+    world_size = get_size()
+    if world_size > 1:
+        chatio = DistChatIO()
+    else:
+        chatio = None
+
+    chat_loop(
+        model,
+        tokenizer,
+        generate_stream_func = generate_stream,
+        #generate_func = generate,
+        max_new_tokens=512,
+        chatio = chatio,
+    )
+
 
 def main(args):
     device = init_dist()
@@ -268,6 +293,9 @@ def main(args):
 
     if args.benchmark:
         run_benchmark(args, local_rank)
+
+    if args.chat:
+        run_chat(args, local_rank)
 
 def get_arges():
     parser = argparse.ArgumentParser(description="PyTorch Template Finetune Example")
@@ -290,6 +318,7 @@ def get_arges():
     parser.add_argument('--benchmark', action='store_true', default=False)
     parser.add_argument('--convert_fp16', action='store_true', default=False)
     parser.add_argument('--verbose', action='store_true', default=False)
+    parser.add_argument('--chat', action='store_true', default=False)
 
     args = parser.parse_args()
     return args
