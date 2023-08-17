@@ -49,13 +49,25 @@ class Conversation:
         """
         self.messages[-1][1] = message
 
+    def copy(self):
+        return Conversation(
+            name=self.name,
+            system=self.system,
+            roles=self.roles,
+            messages=[[x, y] for x, y in self.messages],
+            offset=self.offset,
+            sep=self.sep,
+            sep2=self.sep2,
+            stop_str=self.stop_str,
+            stop_token_ids=self.stop_token_ids,
+        )
 
 CONV_MAP = {
     'llama2': Conversation(
         name="llama-2",
         system="",
         roles=("[INST]", "[/INST]"),
-        messages=[],
+        messages=(),
         offset=0,
         sep=" ",
         sep2=" </s><s>",
@@ -65,4 +77,4 @@ CONV_MAP = {
 
 def get_conv(name: str):
 	assert name in CONV_MAP, f'not find name in conversations.'
-	return CONV_MAP[name]
+	return CONV_MAP[name].copy()

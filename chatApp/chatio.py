@@ -47,3 +47,9 @@ class SimpleChatIO(ChatIO):
         print(" ".join(output_text[pre:]), flush=True)
         return " ".join(output_text)
 
+    def output(self, message):
+        output = message['text']
+        print(output, flush=True)
+        return output
+
+

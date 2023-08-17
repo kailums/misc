@@ -1,12 +1,11 @@
-import os
-import argparse
 import torch
 from inference import chat_loop
 from transformers import LlamaConfig, LlamaTokenizer, LlamaForCausalLM
+from generation import generate, generate_stream
 
-def main(args):
+def main():
     rank = 15
-    model_id = args.model
+    model_id = 'meta-llama/Llama-2-7b-chat-hf'
     config = LlamaConfig.from_pretrained(model_id)
     tokenizer = LlamaTokenizer.from_pretrained(model_id)
     model = LlamaForCausalLM.from_pretrained(model_id, torch_dtype=config.torch_dtype, config=config)
@@ -16,18 +15,9 @@ def main(args):
     chat_loop(
         model,
         tokenizer,
-        max_new_tokens=128
+        generate_func=generate,
+        max_new_tokens=512,
     )
 
-
-def get_arges():
-    parser = argparse.ArgumentParser(description="PyTorch Template Finetune Example")
-    parser.add_argument('--model', type=str)
-    parser.add_argument('--verbose', action='store_true', default=False)
-
-    args = parser.parse_args()
-    return args
-
 if __name__ == '__main__':
-    args = get_arges()
-    main(args)
+    main()
