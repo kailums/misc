@@ -1,7 +1,7 @@
 import time
 import torch
-from conversation import get_conv
-from chatio import ChatIO, SimpleChatIO
+from .conversation import get_conv
+from .chatio import ChatIO, SimpleChatIO
 
 
 def chat_loop(

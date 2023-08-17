@@ -1,7 +1,7 @@
 import torch
-from inference import chat_loop
 from transformers import LlamaConfig, LlamaTokenizer, LlamaForCausalLM
-from generation import generate, generate_stream
+from chatcli import chat_loop, generate, generate_stream
+
 
 def main():
     rank = 15
