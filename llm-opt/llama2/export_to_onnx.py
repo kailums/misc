@@ -14,10 +14,7 @@ from models.modeling_llama import LlamaForCausalLM
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 from onnxruntime.transformers.benchmark_helper import Precision, prepare_environment, setup_logger  # noqa: E402
-from llama_parity import main as parity_check  # noqa: E402
 #from onnxruntime.transformers.onnx_model import OnnxModel  # noqa: E402
-
-from onnxruntime import quantization  # noqa: E402
 
 logger = logging.getLogger("")
 

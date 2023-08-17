@@ -72,6 +72,22 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
+class SimplifiedLayerNormalization(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden_states, weight, eps) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + eps)
+        ret = weight * hidden_states.to(input_dtype)
+
+        return ret
+
+    
+    @staticmethod
+    def symbolic(g: torch.Graph, hidden_states, weight, eps) -> (torch.Value, torch.Value):
+        return g.op('com.microsoft::SimplifiedLayerNormalization', hidden_states, weight, epsilon_f=eps)
+
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -84,11 +100,12 @@ class LlamaRMSNorm(nn.Module):
 
     def forward(self, hidden_states):
         torch.cuda.nvtx.range_push('LN')
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        ret = self.weight * hidden_states.to(input_dtype)
+        #input_dtype = hidden_states.dtype
+        #hidden_states = hidden_states.to(torch.float32)
+        #variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        #hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        #ret = self.weight * hidden_states.to(input_dtype)
+        ret = SimplifiedLayerNormalization.apply(hidden_states, self.weight, self.variance_epsilon)
         torch.cuda.nvtx.range_pop()
         return ret
 
@@ -195,17 +212,27 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
 class RotaryEmbedding(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, position_ids, past_key_value, cos_cache, sin_cache) -> (torch.Tensor, torch.Tensor):
-        seq_len = k.shape[-2]
-        if past_key_value is not None:
-            seq_len += past_key_value[0].shape[-2]
-        cos = cos_cache[:,:,:seq_len,...].to(k.dtype)
-        sin = sin_cache[:,:,:seq_len,...].to(k.dtype)
-        return apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+    def forward(ctx, q, position_ids, cos_cache, sin_cache, past_key) -> torch.Tensor:
+        seq_len = q.shape[-2]
+        if past_key is not None:
+            seq_len += past_key.shape[-2]
+        cos = cos_cache[:,:,:seq_len,...].to(q.dtype)
+        sin = sin_cache[:,:,:seq_len,...].to(q.dtype)
+
+        cos = cos.reshape(cos.shape[2], cos.shape[3])
+        sin = sin.reshape(sin.shape[2], sin.shape[3])
+        cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+        sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        return q_embed
+
     
     @staticmethod
-    def symbolic(g: torch.Graph, q, k, position_ids, cos_cache, sin_cache) -> (torch.Value, torch.Value):
-        return g.op('com.microsoft::RotaryEmbedding', q, k, position_ids, cos_cache, sin_cache, outputs=2)
+    def symbolic(g: torch.Graph, q, position_ids, cos_cache, sin_cache, past_key) -> (torch.Value, torch.Value):
+        if past_key is None:
+            return g.op('com.microsoft::RotaryEmbedding', q, position_ids, cos_cache, sin_cache)
+        else:
+            return g.op('com.microsoft::RotaryEmbedding', q, position_ids, cos_cache, sin_cache, past_key)
 
 
 class LlamaMLP(nn.Module):
@@ -349,7 +376,8 @@ class LlamaAttention(nn.Module):
         torch.cuda.nvtx.range_push('rotary_emb')
         #cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         #query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        query_states, key_states = RotaryEmbedding.apply(query_states, key_states, position_ids, past_key_value, self.rotary_emb.cos_cached, self.rotary_emb.sin_cached)
+        query_states = RotaryEmbedding.apply(query_states, position_ids, self.rotary_emb.cos_cached, self.rotary_emb.sin_cached, past_key_value[0] if past_key_value is not None else None)
+        key_states = RotaryEmbedding.apply(key_states, position_ids, self.rotary_emb.cos_cached, self.rotary_emb.sin_cached, past_key_value[0] if past_key_value is not None else None)
         torch.cuda.nvtx.range_pop()
 
         if past_key_value is not None:

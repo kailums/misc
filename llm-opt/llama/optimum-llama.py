@@ -6,12 +6,11 @@ import time
 import argparse
 from transformers import LlamaTokenizer, LlamaConfig, LlamaForCausalLM
 from optimum.onnxruntime import ORTModelForCausalLM
+import onnx
 import onnxruntime as ort
+from onnxruntime.transformers.optimizer import optimize_by_fusion
+from onnxruntime.transformers.fusion_options import FusionOptions
 
-
-model_path = 'decapoda-research/llama-7b-hf'
-
-saved_name = 'exported-model/llama-7b-hf'
 
 def export_model(args):
     model_path = args.model
@@ -20,6 +19,42 @@ def export_model(args):
     # set use_merged = True to combine decoder_model.onnx and decoder_with_past_model.onnx into one model
     model = ORTModelForCausalLM.from_pretrained(model_path,export=True, use_merged=args.merge)
     model.save_pretrained(save_dir)
+
+def convert_to_fp16(args):
+    model_path = args.model
+    save_dir = args.save_dir
+
+    config = LlamaConfig.from_pretrained(model_path)
+    # use ort optimizer to convert model to float16
+    model_type = 'gpt2'
+    opt_option=FusionOptions(model_type)
+    opt_option.enable_attention=True
+    opt_option.enable_flash_attention=True
+
+    def convert(model_name, out_model_name):
+        optimizer = optimize_by_fusion(
+                onnx.load(model_name), 
+                model_type=model_type,
+                num_heads=config.num_attention_heads,
+                hidden_size=config.hidden_size,
+                optimization_options=opt_option
+            )
+        optimizer.convert_float_to_float16(use_symbolic_shape_infer=True, keep_io_types=False)
+
+        optimizer.save_model_to_file(out_model_name, use_external_data_format=True)
+
+    if args.merge:
+        decoder_model = f'{save_dir}/decoder_model_merged.onnx'
+        opt_out_file = f'{save_dir}/decoder_model_merged_fp16.onnx'
+        convert(decoder_model, opt_out_file)
+    else:
+        decoder_model = f'{save_dir}/decoder_model.onnx'
+        opt_out_file = f'{save_dir}/decoder_model_fp16.onnx'
+        convert(decoder_model, opt_out_file)
+
+        decoder_past_model = f'{save_dir}/decoder_with_past_model.onnx'
+        past_out_file = f'{save_dir}/decoder_with_past_model_fp16.onnx'
+        convert(decoder_past_model, past_out_file)
 
 def setup_session_option(args, local_rank):
     so = ort.SessionOptions()
@@ -45,16 +80,20 @@ def setup_ort_model(args, local_rank):
     model_path = args.model
     save_dir = args.save_dir
 
+    config = LlamaConfig.from_pretrained(model_path)
     sess_opt, provider_opt = setup_session_option(args, local_rank)
     if args.merge:
         decoder_model = f'{save_dir}/decoder_model_merged.onnx'
         decoder_past_model = None
     else:
-        decoder_model = f'{save_dir}/decoder_model.onnx'
-        decoder_past_model = f'{save_dir}/decoder_with_past_model.onnx'
+        if config.torch_dtype != torch.float16:
+            decoder_model = f'{save_dir}/decoder_model_fp16.onnx'
+            decoder_past_model = f'{save_dir}/decoder_with_past_model_fp16.onnx'
+        else:
+            decoder_model = f'{save_dir}/decoder_model.onnx'
+            decoder_past_model = f'{save_dir}/decoder_with_past_model.onnx'
     
     session, past_session = ORTModelForCausalLM.load_model(decoder_model, decoder_past_model, provider='ROCMExecutionProvider', session_options=sess_opt, provider_options=provider_opt)
-    config = LlamaConfig.from_pretrained(model_path)
     
     model = ORTModelForCausalLM(session, config, [decoder_model, decoder_past_model], past_session, use_cache=True, use_io_binding=True, model_save_dir=save_dir)
 
@@ -78,7 +117,6 @@ def run_generate(args, local_rank):
     if args.ort:
         ort_model = setup_ort_model(args, local_rank)
         input_ids = inputs.input_ids.to(ort_model.device)
-        import pdb;pdb.set_trace()
         outputs = ort_model.generate(input_ids=input_ids, max_new_tokens=32)
         print('input ids size: ', inputs.input_ids.shape, ' value: ', inputs.input_ids)
         print('output size: ', outputs[0].shape, ' value: ', outputs[0])
@@ -96,11 +134,15 @@ def run_generate(args, local_rank):
 
 def func_benchmark(args, name, ort_model, input_ids, gen_len):
     for _ in range(args.warm):
+        torch.cuda.nvtx.range_push('generate')
         outputs = ort_model.generate(input_ids = input_ids, max_new_tokens=gen_len)
+        torch.cuda.nvtx.range_pop()
 
     start = time.time()
     for _ in range(args.loop_cnt):
+        torch.cuda.nvtx.range_push('generate')
         outputs = ort_model.generate(input_ids = input_ids, max_new_tokens=gen_len)
+        torch.cuda.nvtx.range_pop()
     cost = time.time() - start
     print(f'[{name}]: prmpot_len: {input_ids.shape[1]}, generate_len: {gen_len}, cost: {cost / args.loop_cnt}s')
 
@@ -113,8 +155,10 @@ def run_benchmark(args, local_rank):
         torch_model = setup_torch_model(args, local_rank)
 
     batch=1
-    prompt_len = ['32', '64', '128', '256', '512', '1024']
-    generate_len = [1, 129]
+    #prompt_len = ['32', '64', '128', '256', '512', '1024']
+    prompt_len = ['32']
+    #generate_len = [1, 129]
+    generate_len = [1]
 
     for p_len in prompt_len:
         for gen_len in generate_len:
@@ -141,6 +185,9 @@ def main(args):
     if args.export:
         export_model(args)
 
+    if args.convert_fp16:
+        convert_to_fp16(args)
+
     if args.generate:
         run_generate(args, local_rank)
 
@@ -166,6 +213,7 @@ def get_arges():
     parser.add_argument('--torch', action='store_true', default=False)
     parser.add_argument('--generate', action='store_true', default=False)
     parser.add_argument('--benchmark', action='store_true', default=False)
+    parser.add_argument('--convert-fp16', action='store_true', default=False)
 
     args = parser.parse_args()
     return args

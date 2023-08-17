@@ -2,3 +2,8 @@
 *.json
 *.csv
 *.pyc
+*.onnx
+*.data
+*.a
+*.o
+*.db

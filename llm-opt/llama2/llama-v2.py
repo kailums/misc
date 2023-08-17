@@ -97,7 +97,7 @@ def setup_session_option(args, local_rank):
 
 def setup_ort_model(args, rank):
     config = LlamaConfig.from_pretrained(args.model)
-    #config.num_hidden_layers = 2
+    config.num_hidden_layers = 2
     decoder_model = f"{args.output_name}_rank-{rank}_decoder_model_fp32.onnx"
     decoder_past_model = f"{args.output_name}_rank-{rank}_decoder_with_past_model_fp32.onnx"
     sess_opt, provider_opt = setup_session_option(args, rank)
@@ -120,47 +120,57 @@ def setup_torch_model(args, use_cuda=True):
     for i in range(world_size):
         if i == rank:
             config = LlamaConfig.from_pretrained(args.model)
-            #config.num_hidden_layers=2
+            config.num_hidden_layers=2
             model = LlamaForCausalLM.from_pretrained(args.model, torch_dtype=config.torch_dtype, config=config)
             model.parallel_model()
-            #model = LlamaForCausalLM.from_pretrained(args.model, config=config)
             if use_cuda:
                 model.to(torch.device(rank))
             model.eval()
             model.requires_grad_(False)
             if args.compile:
-                model = torch.compile(model)
+                model.generate = torch.compile(model.generate, backend="inductor")
         barrier()
     return model
+
+def optimize_transformer(args, model_file, opt_out_file, num_heads, hidden_size):
+    #model_type = 'bert'
+    model_type='t5'
+    opt_option=FusionOptions(model_type)
+    opt_option.enable_attention=False
+    opt_option.enable_flash_attention=False
+    optimizer = optimize_by_fusion(
+            onnx.load(model_file), 
+            model_type=model_type,
+            num_heads=num_heads,
+            hidden_size=hidden_size,
+            optimization_options=opt_option
+        )
+    if args.convert_fp16:
+        optimizer.convert_float_to_float16(use_symbolic_shape_infer=True, keep_io_types=False)
+    optimizer.save_model_to_file(opt_out_file, use_external_data_format=True)
+
 
 def export_model(args):
     rank = get_rank()
     config = LlamaConfig.from_pretrained(args.model)
-    #config.num_hidden_layers = 2
+    config.num_hidden_layers = 2
     world_size = get_size()
+
+    # used for attention fusion, should split by TensorParallel
+    num_heads = config.num_attention_heads // world_size
+    hidden_size = config.hidden_size // world_size
 
     model = setup_torch_model(args, use_cuda=True)
     barrier()
     for i in range(world_size):
         if i == rank:
             decoder_model_fp32, decoder_with_past_fp32 = run_torchscript_export(args, config, model, rank, world_size)
-            # convert to fp16
-            if args.convert_fp16:
-                decoder_model_fp16_path = f"{args.output_name}_rank-{rank}_decoder_model_fp16.onnx"
-                model = OnnxModel(onnx.load_model(decoder_model_fp32, load_external_data=True))
-                model.convert_float_to_float16(keep_io_types=False, op_block_list=["If"])
-                model.save_model_to_file(decoder_model_fp16_path, use_external_data_format=True, all_tensors_to_one_file=True)
-                del model
+            if args.opt_export:
+                decoder_model_out_path = f"{args.output_name}_rank-{rank}_decoder_model_opted.onnx"
+                optimize_transformer(args, decoder_model_fp32, decoder_model_out_path, num_heads, hidden_size)
 
-                # Convert decoder_with_past_model.onnx to FP16
-                decoder_with_past_model_fp16_path = f"{args.output_name}_rank-{rank}_decoder_with_past_model_fp16.onnx"
-                model = OnnxModel(onnx.load_model(decoder_with_past_fp32, load_external_data=True))
-                model.convert_float_to_float16(keep_io_types=False, op_block_list=["If"])
-                model.save_model_to_file(
-                    decoder_with_past_model_fp16_path, use_external_data_format=True, all_tensors_to_one_file=True
-                )
-                del model
-
+                decoder_with_past_model_out_path = f"{args.output_name}_rank-{rank}_decoder_with_past_model_opted.onnx"
+                optimize_transformer(args, decoder_with_past_fp32, decoder_with_past_model_out_path, num_heads, hidden_size)
         barrier()
 
 
@@ -218,11 +228,11 @@ def run_benchmark(args, local_rank):
 
     batch=1
     #prompt_len = ['32', '64', '128', '256', '512', '1024']
-    prompt_len = ['32', '64']
+    prompt_len = ['32']
     #prompt_len = ['2017']
     #prompt_len = ['1024']
-    generate_len = [1, 129]
-    #generate_len = [3]
+    #generate_len = [1, 129]
+    generate_len = [3]
 
     for p_len in prompt_len:
         for gen_len in generate_len:
@@ -273,7 +283,7 @@ def get_arges():
     parser.add_argument('--tune', action='store_true', default=False)
     parser.add_argument('--ort-opt', action='store_true', default=False)
     parser.add_argument('--logging', action='store_true', default=False)
-    parser.add_argument('--opt-export', action='store_true', default=False)
+    parser.add_argument('--opt_export', action='store_true', default=False)
     parser.add_argument('--ort', action='store_true', default=False)
     parser.add_argument('--torch', action='store_true', default=False)
     parser.add_argument('--generate', action='store_true', default=False)

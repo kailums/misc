@@ -43,8 +43,8 @@ def run_onnxruntime(args, model_file, inputs, past_kv_dict):
     model_file = f'{args.save_dir}/{model_file}'
     print('infer ort in rank: ', local_rank, ' m: ', model_file)
     so = setup_session_option(args, local_rank) 
-    #sess = ort.InferenceSession(model_file, sess_options=so, providers=[('ROCMExecutionProvider',{'device_id':local_rank, 'tunable_op_enable': args.tune, 'tunable_op_tuning_enable': args.tune})])
-    sess = ort.InferenceSession(model_file, sess_options=so, providers=['CPUExecutionProvider',])
+    sess = ort.InferenceSession(model_file, sess_options=so, providers=[('ROCMExecutionProvider',{'device_id':local_rank, 'tunable_op_enable': args.tune, 'tunable_op_tuning_enable': args.tune})])
+    #sess = ort.InferenceSession(model_file, sess_options=so, providers=['CPUExecutionProvider',])
     io_binding = sess.io_binding()
 
     # bind inputs by using OrtValue
@@ -56,14 +56,14 @@ def run_onnxruntime(args, model_file, inputs, past_kv_dict):
             np_data = past_kv_dict[k.name].cpu().numpy()
         else:
             print('not support input name: ', k.name)
-        #x = OrtValue.ortvalue_from_numpy(np_data, 'cuda', local_rank)
-        x = OrtValue.ortvalue_from_numpy(np_data)
+        x = OrtValue.ortvalue_from_numpy(np_data, 'cuda', local_rank)
+        #x = OrtValue.ortvalue_from_numpy(np_data)
         io_binding.bind_ortvalue_input(k.name, x)
     # bind outputs
     outputs = sess.get_outputs()
     for out in outputs:
-        #io_binding.bind_output(out.name, 'cuda', local_rank)
-        io_binding.bind_output(out.name)
+        io_binding.bind_output(out.name, 'cuda', local_rank)
+        #io_binding.bind_output(out.name)
 
     sess.run_with_iobinding(io_binding)
 
@@ -98,8 +98,9 @@ def get_dummy_inputs(model_name, config, batch, seq_len, past_seq_len, device):
     # create past seq
     past_kv_dict = {}
     if past_seq_len > 0:
+        #import pdb;pdb.set_trace()
         past_kv = []
-        dtype = torch.float16 if config.torch_dtype == 'float16' else torch.float32
+        dtype = config.torch_dtype
         num_heads = config.num_key_value_heads
         head_dim = config.hidden_size // config.num_attention_heads
         for i in range(config.num_hidden_layers):
@@ -122,8 +123,8 @@ def get_model(args, name):
     config = LlamaConfig.from_pretrained(name)
     config.num_hidden_layers=2
     #model = LlamaForCausalLM(config)
-    #model = LlamaForCausalLM.from_pretrained(name, torch_dtype=config.torch_dtype, config=config)
-    model = LlamaForCausalLM.from_pretrained(name, config=config)
+    model = LlamaForCausalLM.from_pretrained(name, torch_dtype=config.torch_dtype, config=config)
+    #model = LlamaForCausalLM.from_pretrained(name, config=config)
     return config, model
 
 
@@ -136,7 +137,7 @@ def run_torch_model(args, model, inputs, device):
     if args.compile:
         model = torch.compile(model)
 
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    #inputs = {k: v.to(device) for k, v in inputs.items()}
     # try forward
     with torch.no_grad():
         output = model(**inputs)
@@ -172,7 +173,7 @@ def export_model(args, model, config, local_rank, inputs, input_names, output_na
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dyn_axes,
-            opset_version=15,
+            opset_version=17,
             verbose=False,
             operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH,
             custom_opsets={'com.microsoft':1},
@@ -234,10 +235,10 @@ def main(args):
     model_name = f'{args.model}'
 
     local_rank = get_rank()
-    #device = torch.device(f"cuda:{local_rank}")
-    device = torch.device('cpu')
+    device = torch.device(f"cuda:{local_rank}")
+    #device = torch.device('cpu')
 
-    #torch.cuda.set_device(device)
+    torch.cuda.set_device(device)
     torch.cuda.manual_seed(42)
 
     config, model = get_model(args, model_name)
