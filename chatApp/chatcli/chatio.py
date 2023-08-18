@@ -15,22 +15,26 @@ class ChatIO(abc.ABC):
         """Stream output."""
 
 class SimpleChatIO(ChatIO):
-    def __init__(self, multiline: bool = False):
-        self._multiline = multiline
+    def __init__(self, multiline: bool = False, echo=False):
+        self.multiline = multiline
+        self.echo = echo
 
     def prompt_for_input(self, role) -> str:
-        if not self._multiline:
-            return input(f"{role}: ")
-
-        prompt_data = []
-        line = input(f"{role} [ctrl-d/z on empty line to end]: ")
-        while True:
-            prompt_data.append(line.strip())
-            try:
-                line = input()
-            except EOFError as e:
-                break
-        return "\n".join(prompt_data)
+        if not self.multiline:
+            inputs = input(f"{role}: ")
+        else:
+            prompt_data = []
+            line = input(f"{role} [ctrl-d/z on empty line to end]: ")
+            while True:
+                prompt_data.append(line.strip())
+                try:
+                    line = input()
+                except EOFError as e:
+                    break
+            inputs = "\n".join(prompt_data)
+        if self.echo:
+            print(f'{role}: {inputs}')
+        return inputs
 
     def prompt_for_output(self, role: str):
         print(f"{role}: ", end="", flush=True)
@@ -55,13 +59,13 @@ class SimpleChatIO(ChatIO):
 
 class DistChatIO(ChatIO):
     def __init__(self, multiline: bool = False):
-        self._multiline = multiline
+        self.multiline = multiline
         from mpi4py import MPI
         self.comm = MPI.COMM_WORLD
         self.rank = self.comm.Get_rank()
 
     def _prompt_for_input(self, role) -> str:
-        if not self._multiline:
+        if not self.multiline:
             return input(f"{role}: ")
 
         prompt_data = []

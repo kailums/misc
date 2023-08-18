@@ -2,16 +2,18 @@ import time
 import torch
 from .conversation import get_conv
 from .chatio import ChatIO, SimpleChatIO
+from .generation import generate_stream
 
 
 def chat_loop(
     model,
     tokenizer,
     max_new_tokens: int = 512,
-    generate_stream_func = None,
+    generate_stream_func = generate_stream,
     generate_func = None,
     chatio: ChatIO = None,
     debug: bool = False,
+    echo: bool = False,
 ):
     assert generate_stream_func is not None or generate_func is not None, 'should set generate function.'
 
@@ -24,7 +26,7 @@ def chat_loop(
         return conv
 
     if chatio is None:
-        chatio = SimpleChatIO()
+        chatio = SimpleChatIO(echo=echo)
 
     conv = None
 
@@ -69,7 +71,7 @@ def chat_loop(
                 tokenizer,
                 prompt,
                 max_new_tokens,
-                context_len=context_len
+                context_len=context_len,
             )
             outputs = chatio.output(outputs)
             t = time.time()
