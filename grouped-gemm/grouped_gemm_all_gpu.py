@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 
 import random
+import math
 import argparse
 from triton.ops import matmul
 from itertools import product
@@ -15,16 +16,21 @@ if os.path.exists("/ws/work/pytorch_grouped_gemm/build"):
     sys.path.append("/ws/work/pytorch_grouped_gemm/build")
     import PYTORCH_GROUPED_GEMM
 
+def debug_config(kwargs):
+    #print(kwargs)
+    pass
+
 def gen_tune_config():
-    m_range = [16, 32, 64, 128]
-    n_range = [16, 32, 64, 128]
+    m_range = [32, 64, 128]
+    n_range = [32, 64, 128]
     k_range = [32, 64, 128]
     stages = [1,2,3,4,5,6]
-    warps = [4, 8, 16, 32]
+    warps = [4, 8, 16]
     g_range = [2,4,8,16]
+    grid_range = [128, 256, 512, 1024]
     configs = []
-    for m,n,k,g,s,w in product(m_range, n_range, k_range, g_range, stages, warps):
-        configs.append(triton.Config({'BLOCK_M':m, 'BLOCK_N':n, 'BLOCK_K':k, 'GROUP_M':g}, num_stages=s, num_warps=w))
+    for m,n,k,g,s,w,gr in product(m_range, n_range, k_range, g_range, stages, warps, grid_range):
+        configs.append(triton.Config({'BLOCK_M':m, 'BLOCK_N':n, 'BLOCK_K':k, 'GROUP_M':g, 'GRID':gr}, num_stages=s, num_warps=w, pre_hook=debug_config))
 
     return configs
 
@@ -32,9 +38,12 @@ def gen_tune_config():
 @triton.autotune(
     #configs=gen_tune_config(),
     configs=[
-       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_stages=1, num_warps=4),
+       # row1
+       #triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8, 'GRID': 512}, num_stages=5, num_warps=4),
+       # row8
+       triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 16, 'GRID': 256}, num_stages=4, num_warps=8),
     ],
-    key=['K'],
+    key=['K', 'N'],
 )
 @triton.heuristics({
     'EVEN_K': lambda args: args['K'] % args['BLOCK_K'] == 0,
@@ -55,7 +64,7 @@ def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
         TRANS_A: tl.constexpr, TRANS_B: tl.constexpr,
         BETA_ZERO: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-        GROUP_M: tl.constexpr, EVEN_K: tl.constexpr,
+        GROUP_M: tl.constexpr, EVEN_K: tl.constexpr, GRID: tl.constexpr,
     ):
     pid = tl.program_id(0)
     num_pids = tl.num_programs(0)
@@ -84,6 +93,7 @@ def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
             # matrix multiplication
             # re-order program ID for better L2 performance
             compute_id = pid - prefix_sum
+
             width = GROUP_M * grid_m
             group_id = compute_id // width
             group_size = min(grid_n - group_id * GROUP_M, GROUP_M)
@@ -95,9 +105,6 @@ def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
             ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
             rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
             rk = tl.arange(0, BLOCK_K)
-
-            # pid move to next section
-            pid += num_pids
 
             # pointers
             if TRANS_A == 1:
@@ -156,6 +163,11 @@ def grouped_gemm_kernel(num_of_matrix: tl.constexpr,
         
             acc = acc.to(C.dtype.element_ty)
             tl.store(C_ptr, acc, mask=mask)
+
+            # pid move to next section
+            new_pid = pid + num_pids
+            pid = new_pid
+
         # move to the next matrix
         i += 1
         offset_M += M
@@ -208,8 +220,12 @@ def triton_grouped_gemm(array_a, array_b, alpha, beta):
 
     # T(C=AB) ==> T(C) = T(B) * T(A), column-major
     # launch kernel
-    #grid = lambda META: get_grid(**META)
-    grid = (160,)
+    def get_grid(**kwargs):
+        g = kwargs['GRID']
+        return (g,)
+
+    grid = lambda META: get_grid(**META)
+    #grid = (512,)
     grouped_gemm_kernel[grid](len(array_a),
                   n_sizes_tensor, M, K,
                   alpha,
@@ -338,7 +354,7 @@ if __name__ == '__main__':
         dtype = torch.float16
 
     #for i, mnk in enumerate([row2, row3, row6, row7, row8, row9]):
-    for i, mnk in enumerate([row1]):
+    for i, mnk in enumerate([row8]):
         print('test row ', mnk)
         if args.compare:
             compare_result(mnk, device, dtype)

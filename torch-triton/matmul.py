@@ -2,31 +2,30 @@ import torch
 
 import triton
 import triton.language as tl
+
+from itertools import product
+
 #from triton.ops import matmul
+def gen_tune_config():
+    m_range = [32,64, 128]
+    n_range = [32,64, 128]
+    k_range = [32, 64, 128]
+    stages = [1,2,3,4,5,6]
+    warps = [4, 8,16]
+    sp_range = [1, 2, 4, 8]
+    configs = []
+    for m,n,k,g,s,w in product(m_range, n_range, k_range, sp_range, stages, warps):
+        configs.append(triton.Config({'BLOCK_M':m, 'BLOCK_N':n, 'BLOCK_K':k, 'SPLIT_K':g}, num_stages=s, num_warps=w))
+
+    return configs
+
 
 @triton.autotune(
-    configs=[
-        # basic configs for compute-bound matmuls
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=2, num_warps=4),
-        #triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        #triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=5, num_warps=2),
-        ## good for int8
-        #triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        #triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        #triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        #triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=5, num_warps=2),
-    ],
+    configs=gen_tune_config(),
+    #configs=[
+    #    # basic configs for compute-bound matmuls
+    #    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=2, num_warps=4),
+    #],
     key=['M', 'N', 'K'],
 )
 @triton.heuristics({
@@ -155,10 +154,10 @@ if __name__ == '__main__':
            #[128, 128, 128],
            #[256, 256, 256],
            #[512, 512, 512],
-           [1024, 1024, 1024],
-           [2048, 2048, 2048],
-           [4096, 4096, 4096],
-           [8192, 8192, 8192],
+           [32, 4096, 4096],
+           #[2048, 2048, 2048],
+           #[4096, 4096, 4096],
+           #[8192, 8192, 8192],
           ]
     for M, N, K in MNK:
         dtype = torch.float16

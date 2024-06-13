@@ -9,8 +9,10 @@ MPI="mpirun --allow-run-as-root -mca btl_openib_warn_no_device_params_found 0 -m
 #PROF='nsys profile -o grouped-gemm -f true --trace=cuda,nvtx,cublas,cudnn '
 #PROF='/opt/nvidia/nsight-compute/2023.1.1/ncu -o ggemm-cutlas-no-read-c-row8-tune-fp16 -f'
 #PROF='/opt/nvidia/nsight-compute/2023.1.1/ncu -k regex:0d1d2d3d --print-summary=per-kernel '
-PROF='/opt/nvidia/nsight-compute/2023.1.1/ncu -k regex:gemm --print-summary=per-kernel '
-#PROF="rocprof -d rocp --timestamp on --hip-trace --roctx-trace --roctx-rename "
+#PROF='/opt/nvidia/nsight-compute/2023.1.1/ncu -k regex:gemm --print-summary=per-kernel '
+#PROF="rocprof -d rocp --timestamp on --hip-trace --roctx-trace --roctx-rename --stats "
+PROF="rocprof --stats "
 
 #$PROF python matmul.py
 $PROF python grouped_gemm.py --fp16 --speed #--compare #--speed --fp16
+#$PROF python grouped_gemm_cpu_map.py --fp16 --compare #--speed --fp16

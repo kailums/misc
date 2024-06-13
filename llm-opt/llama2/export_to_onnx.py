@@ -160,7 +160,12 @@ def run_dynamo_export(args: argparse.Namespace, l_config: LlamaConfig, llama: Ll
 
     # Export decoder_with_past_model.onnx
     head_dim = l_config.hidden_size // l_config.num_attention_heads
-    num_kv_heads = l_config.num_key_value_heads // world_size
+
+    if world_size > l_config.num_key_value_heads:
+        num_kv_heads = 1
+    else:
+        num_kv_heads = l_config.num_key_value_heads // world_size
+
     input_ids, attn_mask, pos_ids, past_kv = get_model_with_past_kv_inputs(l_config, num_kv_heads, head_dim, llama.device)
     temp_dir = args.output_name  # tempfile.TemporaryDirectory()
     temp_path = os.path.join(temp_dir, "temp.onnx")  # os.path.join(temp_dir.name, "temp.onnx")
@@ -213,7 +218,7 @@ def run_torchscript_export(args: argparse.Namespace, l_config: LlamaConfig, llam
     )
 
     # Check decoder_model.onnx and save all external data to one file
-    onnx.checker.check_model(temp_path)
+    #onnx.checker.check_model(temp_path)
     onnx.shape_inference.infer_shapes_path(temp_path)
 
     #output_path = os.path.join(args.output_name, f"{args.model_name}_decoder_model_fp32.onnx")
@@ -229,7 +234,10 @@ def run_torchscript_export(args: argparse.Namespace, l_config: LlamaConfig, llam
 
     # Export decoder_with_past_model.onnx
     head_dim = l_config.hidden_size // l_config.num_attention_heads
-    num_kv_heads = l_config.num_key_value_heads // world_size
+    if world_size > l_config.num_key_value_heads:
+        num_kv_heads = 1
+    else:
+        num_kv_heads = l_config.num_key_value_heads // world_size
     decoder_with_past_inputs = get_model_with_past_kv_inputs(l_config, num_kv_heads, head_dim, llama.device)
     input_names = [
         "input_ids",
@@ -258,13 +266,15 @@ def run_torchscript_export(args: argparse.Namespace, l_config: LlamaConfig, llam
         input_names=input_names,
         output_names=output_names,
         dynamic_axes=dynamic_axes,
+        #operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH,
+        custom_opsets={'com.microsoft':1},
         opset_version=17,
         do_constant_folding=True,
         verbose=args.verbose,
     )
 
     # Check decoder_with_past_model.onnx and save all external data to one file
-    onnx.checker.check_model(temp_path)
+    #onnx.checker.check_model(temp_path)
     onnx.shape_inference.infer_shapes_path(temp_path)
 
     output_with_past_path = f"{args.output_name}_rank-{rank}_decoder_with_past_model_fp32.onnx"

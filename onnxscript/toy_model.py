@@ -54,6 +54,22 @@ def SkipLayerNormalization(x, skip, gamma, beta=None, bias=None, epsilon: float=
     #       here just return gamma and beta to much signature of SkipLayerNorm
     return out, gamma, beta, x
 
+@script(op_domain_ms)
+def DummyGemm(x: FLOAT[None], w: FLOAT[None], alpha: float, beta: float, transA: int, transB: int) -> FLOAT[None]:
+    x = op.Gemm(x, w, alpha=alpha, beta=beta, transA=transA, transB=transB)
+    #x = op.MatMul(x, w)
+    return x
+
+@script(op_domain_custom)
+def DummyMatMul(x, w):
+    x = op.MatMul(x, w)
+    return x
+
+@script(op_domain_custom)
+def gelu(x):
+    x = x * 0.5 * (1.0 + op.Tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
+    return x
+
 @script(op_domain_custom)
 def fuse_matmul_gelu_matmul(x, w1, b1, w2, b2):
     x = op.MatMul(x, w1) + b1
@@ -62,7 +78,7 @@ def fuse_matmul_gelu_matmul(x, w1, b1, w2, b2):
 
 
 def create_model(batch, seqlen, hidden, out_file_name, dtype=np.float32):
-
+    num_layers = 2
     # We use the script decorator to indicate that
     # this is meant to be translated to ONNX.
     weight_h_h = np.random.rand(hidden, hidden).astype(dtype)
@@ -83,8 +99,8 @@ def create_model(batch, seqlen, hidden, out_file_name, dtype=np.float32):
       input_types = [FLOAT16[batch, seqlen, hidden]]
       output_types = [FLOAT16[batch, seqlen, hidden]]
 
-    @script()
-    def sample_model(
+    @script(op_domain_onnx, default_opset=op)
+    def block(
             X,
     ):
         w_h2h = op.Constant(value=numpy_helper.from_array(weight_h_h))
@@ -101,22 +117,37 @@ def create_model(batch, seqlen, hidden, out_file_name, dtype=np.float32):
         matmul = op.MatMul(X, w_h2h) + b_h2h
         ar = AllReduce(matmul)
         ln = LayerNormalization(ar, ln_scale, ln_bias)
-        out = fuse_matmul_gelu_matmul(ln, w_h4h, b_h4h, w_4hh, b_4hh)
+        #out = fuse_matmul_gelu_matmul(ln, w_h4h, b_h4h, w_4hh, b_4hh)
+        out = op.Reshape(ln, op.Constant(value_ints=[batch*seqlen, hidden]))
+        out = DummyGemm(out, w_h4h, 1., 0., 0, 0) + b_h4h
+        #out = op.MatMul(out, w_h4h) + b_h4h
+        out = gelu(out)
+        out = DummyGemm(out, w_4hh, 1.0, 0.0, 0, 0) + b_4hh
+        out = op.Reshape(out, op.Constant(value_ints=[batch, seqlen, hidden]))
         out = AllReduce(out)
         out,_,_,out2 = SkipLayerNormalization(out, ln, ln_scale, ln_bias, None)
         
         out = op.MatMul(out, w_h2h) + out2
         return out
 
+    @script(op_domain_onnx, default_opset=op)
+    def sample_model(x):
+        for i in range(num_layers):
+            x = block(x)
+
+        return x
+
 
     # onnx_model is an in-memory ModelProto
-    onnx_model = sample_model.to_model_proto(
+    #onnx_model = sample_model.to_model_proto(
+    onnx_model = block.to_model_proto(
                                   input_types=input_types,
                                   output_types=output_types
                               )
 
     # Save the ONNX model at a given path
     onnx.save(onnx_model, out_file_name, save_as_external_data=True, location=f'{out_file_name}.data')
+
 
 def setup_session_option(args, local_rank):
     so = ort.SessionOptions()
@@ -135,7 +166,7 @@ def setup_session_option(args, local_rank):
         so.profile_file_prefix=f'ort-profile-rank{local_rank}'
 
     custom_op_lib_path = "librocm_custom_op_library.so"
-    so.register_custom_ops_library(custom_op_lib_path)
+    #so.register_custom_ops_library(custom_op_lib_path)
 
     return so
 

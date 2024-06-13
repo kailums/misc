@@ -40,7 +40,7 @@ def init_dist():
         rank = 0
         world_size = 1
 
-    dist.init_process_group('nccl', init_method='tcp://127.0.0.1:9876', world_size=world_size, rank=rank)
+    dist.init_process_group('nccl', init_method='tcp://127.0.0.1:18765', world_size=world_size, rank=rank)
     device = torch.device(local_rank)
     return device
 
@@ -98,9 +98,15 @@ def setup_session_option(args, local_rank):
 
 def setup_ort_model(args, rank):
     config = LlamaConfig.from_pretrained(args.model)
-    #config.num_hidden_layers = 2
+    if args.layer2:
+        config.num_hidden_layers = 2
+
     decoder_model = f"{args.output_name}_rank-{rank}_decoder_model_fp32.onnx"
     decoder_past_model = f"{args.output_name}_rank-{rank}_decoder_with_past_model_fp32.onnx"
+    if args.opt_export:
+            decoder_model = f"{args.output_name}_rank-{rank}_decoder_model_opted.onnx"
+            decoder_past_model = f"{args.output_name}_rank-{rank}_decoder_with_past_model_opted.onnx"
+
     sess_opt, provider_opt = setup_session_option(args, rank)
 
     model = OrtModelForLlamaCausalLM(args, decoder_model, decoder_past_model, rank, sess_opt, provider_opt, config=config)
@@ -121,7 +127,8 @@ def setup_torch_model(args, use_cuda=True):
     for i in range(world_size):
         if i == rank:
             config = LlamaConfig.from_pretrained(args.model)
-            #config.num_hidden_layers=2
+            if args.layer2:
+                config.num_hidden_layers=2
             model = LlamaForCausalLM.from_pretrained(args.model, torch_dtype=config.torch_dtype, config=config)
             model.parallel_model()
             if use_cuda:
@@ -154,7 +161,8 @@ def optimize_transformer(args, model_file, opt_out_file, num_heads, hidden_size)
 def export_model(args):
     rank = get_rank()
     config = LlamaConfig.from_pretrained(args.model)
-    #config.num_hidden_layers = 2
+    if args.layer2:
+        config.num_hidden_layers = 2
     world_size = get_size()
 
     # used for attention fusion, should split by TensorParallel
@@ -186,7 +194,8 @@ def run_generate(args, local_rank):
     if args.ort:
         ort_model = setup_ort_model(args, local_rank)
         input_ids = inputs.input_ids.to(ort_model.device)
-        outputs = ort_model.generate(input_ids=input_ids, max_new_tokens=128)
+        attention_mask = inputs.attention_mask.to(ort_model.device)
+        outputs = ort_model.generate(input_ids=input_ids, attention_mask=attention_mask,max_new_tokens=128, do_sample=False, num_beams=1)
         print_out('input ids size: ', inputs.input_ids.shape, ' value: ', inputs.input_ids)
         print_out('output size: ', outputs[0].shape, ' value: ', outputs[0])
         print_out('ort cost: ', ort_model.cost, ' iters: ', ort_model.iters)
@@ -198,21 +207,38 @@ def run_generate(args, local_rank):
     if args.torch:
         torch_model = setup_torch_model(args, use_cuda=True)
         input_ids = inputs.input_ids.to(torch_model.device)
-        outputs = torch_model.generate(input_ids=input_ids, max_new_tokens=128)
+        attention_mask = inputs.attention_mask.to(torch_model.device)
+        outputs = torch_model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=128, do_sample=False, num_beams=1)
         response = tokenizer.decode(outputs[0][1:], skip_special_token=True)
         print_out('output size: ', outputs[0].shape, ' value: ', outputs[0])
         print_out('[Torch] Response:', response)
 
-def func_benchmark(args, name, ort_model, input_ids, gen_len):
+def func_benchmark(args, name, ort_model, input_ids, attention_mask, tokenizer, gen_len):
     for _ in range(args.warm):
-        torch.cuda.nvtx.range_push('generate')
-        outputs = ort_model.generate(input_ids = input_ids, max_new_tokens=gen_len)
+        torch.cuda.nvtx.range_push('warm')
+        outputs = ort_model.generate(input_ids = input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=gen_len,
+                pad_token_id=tokenizer.eos_token_id,
+                do_sample=False,
+                num_beams=1,
+                temperature=1.0,
+                top_k=1.0,
+        )
         torch.cuda.nvtx.range_pop()
 
     start = time.time()
     for _ in range(args.loop_cnt):
         torch.cuda.nvtx.range_push('generate')
-        outputs = ort_model.generate(input_ids = input_ids, max_new_tokens=gen_len)
+        outputs = ort_model.generate(input_ids = input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=gen_len,
+                pad_token_id=tokenizer.eos_token_id,
+                do_sample=False,
+                num_beams=1,
+                temperature=1.0,
+                top_k=1.0,
+        )
         #print_out('ort cost: ', ort_model.cost, ' iters: ', ort_model.iters)
         torch.cuda.nvtx.range_pop()
     cost = time.time() - start
@@ -228,7 +254,7 @@ def run_benchmark(args, local_rank):
         torch_model = setup_torch_model(args, use_cuda=True)
 
     batch=1
-    #prompt_len = ['32', '64', '128', '256', '512', '1024']
+    prompt_len = ['32', '64', '128', '256', '512', '1024']
     prompt_len = ['32']
     #prompt_len = ['2017']
     #prompt_len = ['1024']
@@ -243,18 +269,21 @@ def run_benchmark(args, local_rank):
             if p_len in prompt_pool:
                 prompt = prompt_pool[p_len]
             else:
-                prompt = ['Hello'] * int(p_len)
+                prompt = ['Hello'] * (int(p_len) - 1)
                 prompt = ' '.join(prompt)
 
             inputs = tokenizer(prompt, return_tensors='pt')
 
             if args.ort:
                 input_ids = inputs.input_ids.to(ort_model.device)
-                func_benchmark(args, "ORT", ort_model, input_ids, gen_len)
+                attention_mask = inputs.attention_mask.to(ort_model.device)
+                func_benchmark(args, "ORT", ort_model, input_ids, attention_mask, tokenizer, gen_len)
 
             if args.torch:
                 input_ids = inputs.input_ids.to(torch_model.device)
-                func_benchmark(args, "Torch", torch_model, input_ids, gen_len)
+                attention_mask = inputs.attention_mask.to(torch_model.device)
+                with torch.autograd.profiler.emit_nvtx(True):
+                    func_benchmark(args, "Torch", torch_model, input_ids, attention_mask, tokenizer, gen_len)
 
 def run_chat(args, local_rank):
     tokenizer = LlamaTokenizer.from_pretrained(args.model)
@@ -306,6 +335,7 @@ def get_arges():
     parser.add_argument('--warm', type=int, default=5)
     parser.add_argument('--interval', type=int, default=100)
     parser.add_argument('--profile', action='store_true', default=False)
+    parser.add_argument('--layer2', action='store_true', default=False)
     parser.add_argument('--export', action='store_true', default=False)
     parser.add_argument('--compile', action='store_true', default=False)
     parser.add_argument('--tune', action='store_true', default=False)

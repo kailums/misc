@@ -31,10 +31,10 @@ def gen_tune_config():
 
 
 @triton.autotune(
-    #configs=gen_tune_config(),
-    configs=[
-       triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_stages=3, num_warps=8),
-    ],
+    configs=gen_tune_config(),
+    #configs=[
+    #   triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_stages=3, num_warps=8),
+    #],
     key=['K'],
 )
 @triton.heuristics({

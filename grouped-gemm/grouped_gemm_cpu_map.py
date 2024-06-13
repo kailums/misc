@@ -345,7 +345,7 @@ if __name__ == '__main__':
         dtype = torch.float16
 
     #for i, mnk in enumerate([row2, row3, row6, row7, row8, row9]):
-    for i, mnk in enumerate([row1]):
+    for i, mnk in enumerate([row8]):
         print('test row ', mnk)
         if args.compare:
             compare_result(mnk, device, dtype)

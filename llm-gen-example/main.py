@@ -4,12 +4,22 @@ import random
 import argparse
 from transformers import AutoConfig, AutoTokenizer
 from transformers import MistralForCausalLM
+from huggingface_hub import snapshot_download
 import pickle
+import onnxruntime as ort
+from time import perf_counter
 
 from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
+
+#ort.set_default_logger_severity(0)
+#ort.set_default_logger_verbosity(1000)
 
 
 def vllm_infer(model_id, prompt, gen_tokens):
+    lora_path = snapshot_download(repo_id="yard1/llama-2-7b-sql-lora-test")
+    print('lora path: ', lora_path)
+
     llm = LLM(
         model=model_id,
         tokenizer=model_id,
@@ -18,8 +28,8 @@ def vllm_infer(model_id, prompt, gen_tokens):
         trust_remote_code=True,
         dtype="float16",
         backend=os.environ.get("BACKEND", "torch"),
-        #backend='ort'
-        #enforce_eager=True
+        enforce_eager=True,
+        enable_lora=True,
     )
     sampling_params = SamplingParams(
         n=1,
@@ -31,14 +41,14 @@ def vllm_infer(model_id, prompt, gen_tokens):
         top_k=-1,
     )
 
-    output = llm.generate(prompt, sampling_params)
+    st = perf_counter()
+    output = llm.generate(prompt, sampling_params, lora_request=LoRARequest("sql-lora", 1, lora_path))
+    cost = perf_counter() - st
+    print('generate cost: ', cost)
 
     out_id = 0
     print('[prompt] ', output[out_id].prompt)
     print('[output]: ', output[out_id].outputs[0].text)
-
-    print('[prompt] ', output[out_id + 1].prompt)
-    print('[output]: ', output[out_id + 1].outputs[0].text)
 
 
 def main(model_id, prompt, device_id=0, gen_tokens=128):
@@ -72,33 +82,13 @@ def get_arges():
 if __name__ == '__main__':
     args = get_arges()
     model_id = args.model
-    batch=32
-    gen_tokens = 128
+    batch=2
+    gen_tokens = 16
     device_id = 0
     torch.cuda.set_device(device_id)
 
-    prompt = 'Once upon a time, there was a little girl who loved to read. She loved to read so much that she would read books over and over again. She would read books that were too hard for her to understand, but she would read them anyway. She would read books that were too easy for her to understand, but she would read them anyway. She would read books that were too long for her to understand, but she would read them anyway. She would read books that were too short for her to understand, but she would read them anyway. She would read books that were too boring for her to understand, but she would read them anyway. She would read books that were too exciting for her to understand, but she would read them anyway. She would read books that were too sad for her to understand, but she would read them anyway. She would read books that were too easy for her to understand, but she would read them anyway. She would read books that were too long for her to understand, but she would read them anyway. She would read books that were too short for her to understand, but she would read them anyway. She would read books that were too boring for her to understand, but she would read them anyway. She would read books that were too exciting for her to understand, but she would read them anyway. She would read books that were too sad for her to understand, but she would read them anyway. She would read books that were too happy for her to understand, but she would read them anyway. She would read books that were too scary for her to understand, but she would read them anyway. She would read books that were too funny for her to understand, but she would read them anyway. She would read books that were too weird for her to understand, but she would read them anyway. She would read books that were too beautiful for her to understand, but she would read them anyway. She would read books that were too ugly for her to understand, but she would read them anyway. She would read books that were too smart '
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = tokenizer(prompt)
-    input_ids = inputs['input_ids']
-    p = []
-    for _ in range(batch):
-        size = random.randint(8, 32)
-        p.append(input_ids[:-size])
-
-    prompt = p
-    sizes = [len(p) for p in prompt]
-    print('prompt sizes: ', sizes)
-
-    prompt = tokenizer.batch_decode(prompt)
-
-    #with open('/ws/code/vllm-ort/test-vllm/prompts.pkl', 'rb') as fp:
-    #    prompt = pickle.load(fp)
-    ##prompt = prompt[:2]
-    #prompt = [prompt[0], prompt[0]]
-    #prompt = 'Sure, I can do that. What new technology would you like me to review?,'
-    prompt = ['Hello, how do you do? '] * 2
-    #prompt = ' '.join(prompt)
-    #main(model_id, prompt, device_id, gen_tokens)
+    #tokenizer = AutoTokenizer.from_pretrained(model_id)
+    prompt = 'The capial of France is '
+    #prompt = [prompt] * batch
 
     vllm_infer(model_id, prompt, gen_tokens)
